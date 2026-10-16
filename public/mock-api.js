@@ -40,7 +40,11 @@
     dailyOut: 0,
     cardStatus: 'active',
     seq: 0,
-    otpWrongOnce: false
+    otpWrongOnce: false,
+    // 真实账本。原先账单是**写死的假数据**（"本期共 3 笔支出，合计 540 元"），
+    // 无论用户转多少钱、买多少理财，它都显示同样的数字 —— 那不是"不联动"，
+    // 是账单在说谎。现在每一笔资金变动都记一笔，账单从它汇总。
+    ledger: []
   };
 
   function load() {
@@ -136,6 +140,52 @@
   }
 
   var PEOPLE = { '李娜': 'A002', '王强': 'A003', '刘敏': 'A004', '张伟': 'A001' };
+
+  /* ── 记账与账单 ──────────────────────────────────────────────────────
+     每一笔资金变动都调 logLedger 记一笔，账单从 ST.ledger 汇总。
+     为什么必须有它：原先账单返回的是写死的文案（"本期共 3 笔支出，合计 540 元"），
+     与用户实际做过什么完全无关。那不只是"没有联动"，而是**给出了假数字**。
+     账单是用户最可能用来核对的界面，它说错话的代价比一般文案高得多。 */
+  function logLedger(direction, amount, category) {
+    ST.ledger.push({ direction: direction, amount: amount,
+                     category: category || '未分类', at: Date.now() });
+  }
+
+  function billText() {
+    var exp = {}, inc = {}, expTotal = 0, incTotal = 0, expCnt = 0;
+    ST.ledger.forEach(function (e) {
+      if (e.direction === 'debit') {
+        exp[e.category] = (exp[e.category] || 0) + e.amount;
+        expTotal += e.amount; expCnt++;
+      } else {
+        inc[e.category] = (inc[e.category] || 0) + e.amount;
+        incTotal += e.amount;
+      }
+    });
+    if (!expCnt && !incTotal) {
+      return '本期还没有任何资金变动。';
+    }
+    var lines = ['本期共 ' + expCnt + ' 笔支出，合计 **' + YUAN(expTotal) + ' 元**。'];
+    var keys = Object.keys(exp).sort(function (a, b) { return exp[b] - exp[a]; });
+    if (keys.length) {
+      lines.push('支出分类：');
+      keys.forEach(function (k) {
+        lines.push('· ' + k + '：' + YUAN(exp[k]) + ' 元（' +
+                   (expTotal ? (exp[k] * 100 / expTotal).toFixed(1) : '0.0') + '%）');
+      });
+    } else {
+      lines.push('（本期没有支出）');
+    }
+    var ik = Object.keys(inc);
+    if (ik.length) {
+      lines.push('流入：');
+      ik.forEach(function (k) {
+        lines.push('· ' + k + '：' + YUAN(inc[k]) + ' 元');
+      });
+      lines.push('合计流入 **' + YUAN(incTotal) + ' 元**。');
+    }
+    return lines.join('\n');
+  }
 
   // 与 bank/core.py 的 WEALTH_CATALOG 保持一致（含起购金额，用于申购校验）
   // 可动用余额 = 余额 − 锁定。与 Python 侧的 core.available() 同一口径。
@@ -434,11 +484,10 @@
 
     if (/账单|消费|花了多少|支出|流水/.test(text)) {
       logEvent('tier.checked', { action: 'bill.analyze', tier: 'green' });
+      var bill = billText();
       return { type: 'result', tier: 'green', tier_label: fmtTier('green'),
-        auto_executed: true,
-        message: '本期共 3 笔支出，合计 **540.00 元**。\n主要去向：\n' +
-                 '· 转账给李娜：500.00 元（92.6%）\n· 转账给王强：30.00 元（5.6%）\n' +
-                 '· 未分类：10.00 元（1.9%）',
+        auto_executed: true, message: bill,
+        data: { ledger: ST.ledger },
         intent: { intent: 'bill_analyze', confidence: 0.9,
                   slots: { acct: 'A001', period: 'month' } } };
     }
@@ -891,6 +940,9 @@
                      YUAN(ST.balances.A001) + ' 元，需要 ' + YUAN(s.amount) + ' 元' };
         }
         ST.balances.A001 -= s.amount;
+        // 联动扣款也是真实的资金流出，必须记账 ——
+        // 否则账单里看不到它，用户会以为钱没花。
+        logLedger('debit', s.amount, '跨场景联动');
         // 锁定金额按实际花费释放，不超过本计划剩余锁定额
         var rel = Math.min(s.amount, rnPlan.locked);
         ST.locked = Math.max(0, (ST.locked || 0) - rel);
@@ -998,6 +1050,7 @@
         }
         ST.balances.A001 -= wa;
         ST.holdings[wp] = (ST.holdings[wp] || 0) + wa;
+        logLedger('debit', wa, '理财申购');
         save(ST);
         logEvent('exec.succeeded', { op: opId, action: 'wealth.purchase', amount: wa });
         return { type: 'result', tier: 'red', tier_label: fmtTier('red'),
@@ -1015,6 +1068,7 @@
       ST.holdings[wp] = hold - wa;
       if (ST.holdings[wp] <= 0) delete ST.holdings[wp];
       ST.balances.A001 += wa;
+      logLedger('credit', wa, '理财赎回');
       save(ST);
       logEvent('exec.succeeded', { op: opId, action: 'wealth.redeem', amount: wa });
       return { type: 'result', tier: 'red', tier_label: fmtTier('red'),
@@ -1064,6 +1118,7 @@
     ST.balances.A001 -= cents;
     ST.balances[to] = (ST.balances[to] || 0) + cents;
     ST.dailyOut += cents;
+    logLedger('debit', cents, '转账');
     save(ST);
     var txid = 'TX' + sha256Sync(opId + Date.now()).slice(0, 12).toUpperCase();
     logEvent('exec.succeeded', { transfer_id: txid, amount: cents,

@@ -853,41 +853,51 @@ class AgentSession:
 
     # ── 账单分析 ──────────────────────────────────────────────────────
     def _analyze_bill(self, acct, period):
-        rows = self.core.conn.execute('''
-            SELECT * FROM transfer WHERE from_acct=? AND status='succeeded'
-            ORDER BY created_at DESC''', (acct,)).fetchall()
-        cats, total = {}, 0
-        for r in rows:
-            note = r['note'] or '未分类'
-            cats[note] = cats.get(note, 0) + r['amount']
-            total += r['amount']
-        items = sorted(({'category': k, 'amount': v} for k, v in cats.items()),
-                       key=lambda x: -x['amount'])
-        for it in items:
-            it['share'] = round(it['amount'] / total, 4) if total else 0
-        return {'period': period, 'total': total, 'count': len(rows), 'categories': items}
+        """账单分析。**数据源是 ledger，不是 transfer 表。**
+
+        这是修掉的一个真实缺陷：原先只查 `transfer`，于是
+          · 理财申购（走 wealth_order）
+          · 理财赎回
+          · 跨场景联动扣款（走 linkage_step）
+        这些**真实的资金变动在账单里全都看不到**。实测过一个例子：
+        余额从 5000 变成 3500（花掉 1500），账单却只显示"1 笔支出、合计 500"
+        —— 另外 1000 元凭空消失了。对账单来说这是硬伤。
+
+        `ledger` 是双重记账的产物，本来就记录每一笔资金变动，
+        所以它才是账单的正确数据源。
+
+        口径：流入与流出分开报，不并成一个净额。
+        "赎回 1000、申购 2000" 与 "净支出 1000" 是两件事，
+        合并会让用户看不出中间发生过什么。
+        """
+        since = None
+        if period == 'month':
+            since = self.core.month_start_ms()
+        elif period == 'year':
+            lt = time.localtime()
+            since = int(time.mktime((lt.tm_year, 1, 1, 0, 0, 0, 0, 0, -1)) * 1000)
+
+        agg = self.core.spending_by_category(acct, since)
+        exp_total = agg['expense_total']
+        for it in agg['expense'] + agg['income']:
+            it['share'] = (round(it['amount'] / exp_total, 4)
+                           if exp_total else 0)
+        return {
+            'period': period,
+            'categories': agg['expense'],
+            'income': agg['income'],
+            'total': exp_total,
+            'income_total': agg['income_total'],
+            'count': sum(x['count'] for x in agg['expense']),
+        }
 
     def _detect_anomalies(self, acct):
-        """异常交易识别：这里用「金额显著偏离历史」这一条规则。
+        """异常交易识别：金额显著偏离历史中位数。
 
-        生产环境会用更多特征（地点突变、时间异常、商户首次出现等），
-        但演示一条能讲清楚的规则，比堆一堆说不清的规则更有说服力。
+        口径与账单一致（都读 ledger 的 debit），否则会出现
+        "账单里看不到、却被判为异常"的错位。
         """
-        rows = [dict(r) for r in self.core.conn.execute(
-            'SELECT * FROM transfer WHERE from_acct=? AND status="succeeded"',
-            (acct,)).fetchall()]
-        if len(rows) < 3:
-            return {'anomalies': [], 'note': '交易样本不足 3 笔，暂不做异常判断'}
-        amts = sorted(r['amount'] for r in rows)
-        mid = amts[len(amts) // 2]
-        out = []
-        for r in rows:
-            if mid > 0 and r['amount'] > mid * 3:
-                out.append({'transfer_id': r['id'], 'amount': r['amount'],
-                            'median': mid, 'ratio': round(r['amount'] / mid, 2),
-                            'reason': '金额为中位数 %.2f 元的 %.1f 倍'
-                                      % (cents_to_yuan(mid), r['amount'] / mid)})
-        return {'anomalies': out, 'median': mid, 'count': len(rows)}
+        return self.core.detect_anomalies(acct)
 
     # ── 结果包装 ──────────────────────────────────────────────────────
     def _issue_lock_card(self, acct):
@@ -948,16 +958,39 @@ class AgentSession:
                 r['owner'], cents_to_yuan(r['balance']),
                 {'active': '正常', 'frozen': '已冻结', 'lost': '已挂失'}.get(r['card_status'], r['card_status']))
         if name == 'bill_analyze':
-            lines = ['本期共 %d 笔支出，合计 **%s 元**。' % (r['count'], cents_to_yuan(r['total']))]
+            # 支出与流入分开呈现。合并成一个净额会让用户看不出中间发生过什么
+            # （“赎回 1000、申购 2000” 与 “净支出 1000” 是两件事）。
+            lines = ['本期共 %d 笔支出，合计 **%s 元**。'
+                     % (r['count'], cents_to_yuan(r['total']))]
             if r['categories']:
-                lines.append('主要去向：')
-                for c in r['categories'][:5]:
-                    lines.append('· %s：%s 元（%.1f%%）' % (
-                        c['category'], cents_to_yuan(c['amount']), c['share'] * 100))
+                lines.append('支出分类：')
+                for c in r['categories'][:6]:
+                    lines.append('· %s：%s 元（%.1f%%，%d 笔）'
+                                 % (c['category'], cents_to_yuan(c['amount']),
+                                    c['share'] * 100, c['count']))
+            else:
+                lines.append('（本期没有支出）')
+            inc = r.get('income') or []
+            if inc:
+                lines.append('流入：')
+                for c in inc[:4]:
+                    lines.append('· %s：%s 元（%d 笔）'
+                                 % (c['category'], cents_to_yuan(c['amount']),
+                                    c['count']))
+                lines.append('合计流入 **%s 元**。' % cents_to_yuan(r.get('income_total', 0)))
             return '\n'.join(lines)
         if name == 'bill_anomaly':
+            # 样本不足时必须说“无法判断”，而不是“未发现异常”。
+            # 踩过的坑：原先直接拿 r.get('median', 0) 拼文案，
+            # 而样本不足时返回的是 {'note': ...}（**没有 median 键**），
+            # 于是显示成“未发现明显异常交易（中位金额 0.00 元）”。
+            # 只有 2 笔数据时说“未发现异常”等于给了虚假的安全感。
+            if 'note' in r and not r.get('median'):
+                return '%s（已扫描 %d 笔支出）。' % (
+                    r['note'], r.get('count', 0))
             if not r['anomalies']:
-                return '未发现明显异常交易。（中位金额 %s 元）' % cents_to_yuan(r.get('median', 0))
+                return '未发现明显异常交易。（已扫描 %d 笔，中位金额 %s 元）' % (
+                    r.get('count', 0), cents_to_yuan(r.get('median', 0)))
             lines = ['发现 %d 笔金额异常偏高的交易：' % len(r['anomalies'])]
             for a in r['anomalies']:
                 lines.append('· %s 元 —— %s' % (cents_to_yuan(a['amount']), a['reason']))

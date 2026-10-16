@@ -183,6 +183,7 @@ class Core:
           transfer_id TEXT REFERENCES transfer(id),
           acct        TEXT NOT NULL REFERENCES account(id),
           owner_acct  TEXT,                          -- 该笔归属哪个账户（含理财）
+          category    TEXT,                          -- 消费/收入分类，供账单分析使用
           direction   TEXT NOT NULL,                -- debit | credit
           amount      INTEGER NOT NULL,             -- 恒为正数，方向看 direction
           balance_after INTEGER NOT NULL,
@@ -293,6 +294,10 @@ class Core:
         cols = {r['name'] for r in c.execute('PRAGMA table_info(account)')}
         if 'locked_amount' not in cols:
             c.execute('ALTER TABLE account ADD COLUMN locked_amount INTEGER NOT NULL DEFAULT 0')
+
+        lcols = {r['name'] for r in c.execute('PRAGMA table_info(ledger)')}
+        if 'category' not in lcols:
+            c.execute('ALTER TABLE ledger ADD COLUMN category TEXT')
 
     # ── 读 ─────────────────────────────────────────────────────────────
     def get_account(self, acct_id):
@@ -429,12 +434,16 @@ class Core:
             c.execute('UPDATE account SET balance=? WHERE id=?', (new_dst, to_acct))
             # owner_acct 标明这笔归属哪个账户：付款方记 from，收款方记 to。
             # reconcile() 只按它汇总，一笔只算一次。
-            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?,?)',
-                      (tid, from_acct, from_acct, 'debit', amount, new_src, now))
-            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?,?)',
-                      (tid, to_acct, to_acct, 'credit', amount, new_dst, now))
+            # category 记录这笔属于哪类消费/收入，账单分析直接读它。
+            # 转账的收款人名字放备注，分类固定为「转账」——
+            # 原先把收款人当分类，于是账单上"主要去向"显示的是人名，
+            # 那不是消费分类，是交易对手。
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,'
+                      'balance_after,category,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                      (tid, from_acct, from_acct, 'debit', amount, new_src, '转账', now))
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,'
+                      'balance_after,category,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                      (tid, to_acct, to_acct, 'credit', amount, new_dst, '转账收入', now))
 
             c.execute('COMMIT')
             return {
@@ -498,12 +507,12 @@ class Core:
             c.execute('UPDATE account SET balance=? WHERE id=?', (bd - amt, d))
             c.execute('UPDATE transfer SET status=?, reversed_at=? WHERE id=?',
                       ('reversed', now, transfer_id))
-            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?,?)',
-                      (transfer_id, f, f, 'credit', amt, bf + amt, now))
-            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?,?)',
-                      (transfer_id, d, d, 'debit', amt, bd - amt, now))
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,'
+                      'balance_after,category,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                      (transfer_id, f, f, 'credit', amt, bf + amt, '转账冲正', now))
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,'
+                      'balance_after,category,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                      (transfer_id, d, d, 'debit', amt, bd - amt, '转账冲正', now))
             c.execute('COMMIT')
             return {'transfer_id': transfer_id, 'status': 'reversed',
                     'idempotent_replay': False, 'reason': reason}
@@ -624,9 +633,9 @@ class Core:
             # 资金变动必须留痕，否则 reconcile() 对不上 ——
             # 申购扣了活期余额却不写 ledger，账就"平不了"（实测差 -500000 分）。
             c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,'
-                      'amount,balance_after,created_at) VALUES(?,?,?,?,?,?,?)',
+                      'amount,balance_after,category,created_at) VALUES(?,?,?,?,?,?,?,?)',
                       (None, acct_id, acct_id, 'debit', amount,
-                       a['balance'] - amount, now))
+                       a['balance'] - amount, '理财申购', now))
             c.execute('COMMIT')
             return {'order_id': oid, 'status': 'succeeded',
                     'idempotent_replay': False, 'amount': amount,
@@ -689,9 +698,9 @@ class Core:
                       (oid, idem_key, acct_id, product, 'redeem', amount,
                        'succeeded', now))
             c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,'
-                      'amount,balance_after,created_at) VALUES(?,?,?,?,?,?,?)',
+                      'amount,balance_after,category,created_at) VALUES(?,?,?,?,?,?,?,?)',
                       (None, acct_id, acct_id, 'credit', amount,
-                       a['balance'] + amount, now))
+                       a['balance'] + amount, '理财赎回', now))
             c.execute('COMMIT')
             return {'order_id': oid, 'status': 'succeeded',
                     'idempotent_replay': False, 'amount': amount,
@@ -933,8 +942,9 @@ class Core:
                           (new_balance, new_locked, p['acct']))
                 # 资金变动必须留痕 —— 不留痕 reconcile() 立刻不平
                 c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,'
-                          'amount,balance_after,created_at) VALUES(?,?,?,?,?,?,?)',
-                          (None, p['acct'], p['acct'], 'debit', amt, new_balance, now))
+                          'amount,balance_after,category,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                          (None, p['acct'], p['acct'], 'debit', amt, new_balance,
+                           '跨场景联动', now))
             else:
                 c.execute('UPDATE account SET locked_amount=? WHERE id=?',
                           (new_locked, p['acct']))
@@ -999,6 +1009,89 @@ class Core:
             args.append(acct_id)
         sql += ' ORDER BY s.due_date, s.seq'
         return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def spending_by_category(self, acct_id, since_ms=None):
+        """按分类汇总资金流出与流入，供账单分析使用。
+
+        **为什么读 ledger 而不是 transfer 表**：
+        原先账单只查 `transfer`，于是理财申购（走 `wealth_order`）、
+        联动扣款（走 `linkage_step`）这些**真实的资金流出在账单里完全看不到**。
+        实测过一个例子：余额从 5000 变成 3500（花了 1500），
+        账单却只显示"1 笔支出、合计 500"—— 另外 1000 元凭空消失。
+
+        而 `ledger` 本来就记录了**每一笔**资金变动（这是双重记账的意义），
+        所以账单的正确数据源是它，不是某一张业务表。
+
+        口径说明：
+          · 只统计 `owner_acct = acct_id` 的记录（归属字段只能有一个；
+            用 `acct OR owner_acct` 会把转账的两条记录各命中一次，借贷相抵）
+          · `transfer_id IS NOT NULL` 的是转账/冲正，`IS NULL` 的是理财与联动
+          · 流入（credit）与流出（debit）分开返回，不混成一个净额 ——
+            "赎回 1000、申购 2000" 和"净支出 1000"是两件事
+        """
+        where = "owner_acct=?"
+        args = [acct_id]
+        if since_ms:
+            where += " AND created_at>=?"
+            args.append(since_ms)
+
+        rows = self.conn.execute('''
+            SELECT COALESCE(category, '未分类') AS cat,
+                   direction,
+                   COALESCE(SUM(amount), 0) AS total,
+                   COUNT(*) AS cnt
+            FROM ledger WHERE %s
+            GROUP BY cat, direction
+            ORDER BY (direction='debit') DESC, total DESC''' % where, args).fetchall()
+
+        out = {'expense': [], 'income': [], 'expense_total': 0, 'income_total': 0}
+        for r in rows:
+            item = {'category': r['cat'], 'amount': r['total'], 'count': r['cnt']}
+            if r['direction'] == 'debit':
+                out['expense'].append(item)
+                out['expense_total'] += r['total']
+            else:
+                out['income'].append(item)
+                out['income_total'] += r['total']
+        return out
+
+    def month_start_ms(self, now_ms=None):
+        """本月 1 号 0 点的毫秒时间戳。账单默认统计本月。"""
+        lt = time.localtime((now_ms or int(time.time() * 1000)) / 1000)
+        return int(time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1)) * 1000)
+
+    def detect_anomalies(self, acct_id):
+        """异常交易识别：找出**流出**金额显著偏离历史的记录。
+
+        口径与账单一致（读 ledger 的 debit），这样"账单里看到的"和
+        "异常识别扫的"是同一批数据 —— 否则会出现"账单里没有、却被判异常"。
+        """
+        rows = self.conn.execute('''
+            SELECT id, amount, category, created_at FROM ledger
+            WHERE owner_acct=? AND direction='debit' ORDER BY amount''',
+            (acct_id,)).fetchall()
+        if len(rows) < 3:
+            # 返回真实笔数，而不是只有一句 note。
+            # 否则上层拼文案时只能写"已扫描 0 笔"—— 明明是 2 笔，
+            # 只是未达判定门槛。数字与事实不符会让人怀疑整份报告。
+            return {'anomalies': [], 'count': len(rows), 'median': None,
+                    'note': '支出样本不足 3 笔，暂不做异常判断'}
+        amts = [r['amount'] for r in rows]
+        mid = amts[len(amts) // 2]
+        out = []
+        for r in rows:
+            if mid > 0 and r['amount'] > mid * 3:
+                out.append({'ledger_id': r['id'], 'amount': r['amount'],
+                            'category': r['category'], 'median': mid,
+                            'ratio': round(r['amount'] / mid, 2),
+                            # cents_to_yuan 返回的是**字符串**，不能配 %.2f ——
+                            # 这里曾写成 '%.2f 元' % cents_to_yuan(mid)，
+                            # 结果是运行时 TypeError（不是输出错误）。
+                            # 而且只有支出样本 ≥3 笔时才会走到这一行，
+                            # 所以样本少的测试发现不了。
+                            'reason': '金额为中位数 %s 元的 %.1f 倍'
+                                      % (cents_to_yuan(mid), r['amount'] / mid)})
+        return {'anomalies': out, 'median': mid, 'count': len(rows)}
 
     def close(self):
         """关闭所有线程的连接。"""
