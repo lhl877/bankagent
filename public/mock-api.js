@@ -373,16 +373,24 @@
 
     // 转账
     var cents = body._amount || 0;
-    logEvent('confirm.checked', { op: opId, phase: 'execute' });
-    if (cents > CAP) {
+    // 关键：用**已判定的级别**决定是否需要强验证，而不是用金额重新推断。
+    //
+    // 这里踩过一个真实的漏洞：原先写的是 `if (cents > CAP)`（单笔超 1000 才要验证码）。
+    // 但红级有**两个**触发条件 —— 单笔超限、或**日累计**超限。
+    // 于是「日累计到 1000 后再转 500」这条路径被判为红色、
+    // 弹出了验证码输入框，但执行时因为 500 ≤ 1000 就不校验 OTP 了。
+    // 结果：随便输 000000 也能转账成功。
+    //
+    // 教训是通用的：**授权必须按"当初判定的范围"校验，不能重新推断。**
+    // 重新推断就会与判定逻辑产生分歧，而分歧处就是绕过点。
+    var wasRed = body._wasRed === true;
+    logEvent('confirm.checked', { op: opId, phase: 'execute', tier: wasRed ? 'red' : 'yellow' });
+    if (wasRed) {
       if (!code) {
         return { type: 'need_strong_verification',
           message: '这是红色级别操作，需要短信验证码确认。', op_id: opId,
           hint: '确认凭证仍然有效，获取验证码后继续即可，不需要重新发起。' };
       }
-      // 必须与下发的验证码逐字比对。
-      // 踩过的坑：最初只校验了"6 位数字"格式，结果输 000000 也能通过 ——
-      // 真实后端用 HMAC 校验，静态版必须自己补上这一步。
       if (code !== ISSUED_CODE) {
         logEvent('verify.rejected', { op: opId, reason: '验证码不正确' });
         return { type: 'refused', message: '验证码不正确', op_id: opId, retryable: true };
@@ -450,7 +458,9 @@
     // 执行接口需要上一次 plan 里的金额与收款人（真实后端从服务端状态取）
     if (path === '/api/execute' && window.__lastOp) {
       body._amount = window.__lastOp._amount;
-      body._needsStrong = window.__lastOp.tier === 'red';
+      // 把"当初判定的级别"带过去。执行时必须按它校验，
+      // 不能用金额重新推断 —— 那会漏掉"日累计触发红级"这条路径。
+      body._wasRed = window.__lastOp.tier === 'red';
       body.to_acct = (window.__lastOp._payee || {}).acct;
       body.to_name = (window.__lastOp._payee || {}).name;
     }

@@ -130,13 +130,31 @@ def check_tier(action, params, core, acct_id):
 
     # ── 动态升级规则：转账按金额抬级 ────────────────────────────────
     if action in ('transfer.small', 'transfer.large', 'transfer.scheduled'):
-        amount = int(params.get('amount') or 0)
+        amount = params.get('amount')
         dynamic = True
 
-        if amount <= 0:
-            # 金额还没定，先按当前基准；执行前会重算
-            reasons.append('金额尚未确定')
-        elif amount > SMALL_TRANSFER_CAP:
+        # 金额本身非法/缺失时**按最高级处理**，而不是放行为黄色。
+        #
+        # 这里修的是一个校验缺口：原先写 `amount = int(params.get('amount') or 0)`，
+        # 于是 None 和负数都会先变成 0 或负数，然后落进 else 分支被判为黄色。
+        # 后果不是可利用漏洞（core.transfer 会拒绝非正整数），但有两处坏处：
+        #   ① 分级输出是错的 —— "黄色"的语义是"有副作用但金额小"，
+        #      而"金额未知"根本不是这个含义；
+        #   ② 违反了 fail-closed 原则 —— 无法判定风险时应当收紧，不是放松。
+        # 安全设计里"默认拒绝"必须覆盖"输入异常"这一类，不能只覆盖"动作未登记"。
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+            return {
+                'tier': RED,
+                'action': action,
+                'desc': spec['desc'],
+                'reasons': ['%s 的基准级别：%s' % (spec['desc'], TIER_LABEL[spec['tier']]),
+                            '金额缺失、非整数或非正数（%r）→ 无法评估风险，按最高级处理'
+                            % (amount,)],
+                'needs': ['user_confirmation', 'strong_verification'],
+                'dynamic': True,
+            }
+
+        if amount > SMALL_TRANSFER_CAP:
             tier = RED
             reasons.append('单笔 %s 元 > %s 元，超出小额上限 → 升为红色'
                            % (fmt(amount), fmt(SMALL_TRANSFER_CAP)))
