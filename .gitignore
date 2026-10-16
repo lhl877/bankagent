@@ -1,27 +1,26 @@
-# 运行时产生的文件
+# 杩愯鏃朵骇鐢熺殑鏂囦欢
 demo_bank.db
 demo_bank.db-wal
 demo_bank.db-shm
 audit.log
 bank.db*
 
-# 构建中间产物（PDF 由 tools/md2pdf.py 生成，不纳入版本控制）
-build/
+# 鏋勫缓涓棿浜х墿锛圥DF 鐢?tools/md2pdf.py 鐢熸垚锛屼笉绾冲叆鐗堟湰鎺у埗锛?build/
 
-# Python 缓存
+# Python 缂撳瓨
 __pycache__/
 *.pyc
 *.pyo
 
-# 编辑器与系统
+# 缂栬緫鍣ㄤ笌绯荤粺
 .vscode/
 .idea/
 *.swp
 .DS_Store
 Thumbs.db
 
-# 调试用临时脚本（下划线开头）。
-# 注意必须用 !__init__.py 排除，否则会把包的 __init__.py 一起忽略掉，
-# 别人 clone 下来 import 会直接失败。这个坑踩过一次。
-_*.py
+# 璋冭瘯鐢ㄤ复鏃惰剼鏈紙涓嬪垝绾垮紑澶达級銆?# 娉ㄦ剰蹇呴』鐢?!__init__.py 鎺掗櫎锛屽惁鍒欎細鎶婂寘鐨?__init__.py 涓€璧峰拷鐣ユ帀锛?# 鍒汉 clone 涓嬫潵 import 浼氱洿鎺ュけ璐ャ€傝繖涓潙韪╄繃涓€娆°€?_*.py
 !__init__.py
+
+# Cloudflare 本地状态（含账号缓存，不进公开仓库）
+.wrangler/

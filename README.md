@@ -1,4 +1,11 @@
-# bankagent · 银行 AI 智能体
+# 银行 AI 智能体（AI Banking Agent）
+
+> **线上演示**：<https://bankagent.pages.dev>
+> **代码仓库**：<https://github.com/lhl877/bankagent>
+>
+> ⚠️ 线上是**静态演示版**（Cloudflare Pages 只能托管静态文件，跑不了 Python）。
+> 分级判定与金额计算在前端按相同规则重算，响应内容取自本文档所述后端的实测输出。
+> **完整版请本地跑 `python api_server.py`**，区别见 [`docs/静态版部署说明.md`](docs/静态版部署说明.md)。
 
 用一句话说清需求，Agent 自主理解意图、规划任务链路，并在**严格的安全框架内**完成银行业务操作。
 
