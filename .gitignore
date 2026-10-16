@@ -1,24 +1,30 @@
-# 鏉╂劘顢戦弮鏈甸獓閻㈢喓娈戦弬鍥︽
+# 运行时产生的文件
 demo_bank.db
 demo_bank.db-wal
 demo_bank.db-shm
 audit.log
 bank.db*
 
-# 閺嬪嫬缂撴稉顓㈡？娴溠呭⒖閿涘湧DF 閻?tools/md2pdf.py 閻㈢喐鍨氶敍灞肩瑝缁惧啿鍙嗛悧鍫熸拱閹貉冨煑閿?build/
+# 构建中间产物与打包目录
+build/
+dist/
 
-# Python 缂傛挸鐡?__pycache__/
+# Cloudflare 本地状态（含账号缓存）
+.wrangler/
+
+# Python 缓存
+__pycache__/
 *.pyc
 *.pyo
 
-# 缂傛牞绶崳銊ょ瑢缁崵绮?.vscode/
+# 编辑器与系统
+.vscode/
 .idea/
 *.swp
 .DS_Store
 Thumbs.db
 
-# 鐠嬪啳鐦悽銊ゅ閺冩儼鍓奸張顒婄礄娑撳鍨濈痪鍨磻婢惰揪绱氶妴?# 濞夈劍鍓拌箛鍛淬€忛悽?!__init__.py 閹烘帡娅庨敍灞芥儊閸掓瑤绱伴幎濠傚瘶閻?__init__.py 娑撯偓鐠у嘲鎷烽悾銉﹀竴閿?# 閸掝偂姹?clone 娑撳娼?import 娴兼氨娲块幒銉ャ亼鐠愩儯鈧倽绻栨稉顏勬綑闊晞绻冩稉鈧▎掳鈧?_*.py
+# 调试用临时脚本（下划线开头）
+_*.py
+# 必须显式排除，否则会把包的 __init__.py 一起忽略，clone 后 import 直接失败
 !__init__.py
-
-# Cloudflare 鏈湴鐘舵€侊紙鍚处鍙风紦瀛橈紝涓嶈繘鍏紑浠撳簱锛?.wrangler/
-dist/
