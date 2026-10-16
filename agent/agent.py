@@ -366,8 +366,8 @@ class IntentParser:
         #   理财 必须在 转账 **之前** —— 否则「赎回 1000 元」会被转账的金额规则吃掉。
         # 每条注释都对应一次真实的误判，改动前请先跑意图回归。
         for handler in (self._p_balance, self._p_bill, self._p_subscription,
-                        self._p_card, self._p_wealth, self._p_transfer,
-                        self._p_greeting):
+                        self._p_card, self._p_wealth, self._p_linkage,
+                        self._p_transfer, self._p_greeting):
             it = handler(t, session_state)
             if it:
                 it.raw = t
@@ -423,9 +423,18 @@ class IntentParser:
                               {'acct': acct, 'product': product,
                                'amount_yuan': amt}, 0.85)
             # 「买」是口语最常见的申购说法，必须支持。
-            # 但不能裸匹配 —— 要排除「买卡」（那是卡场景），
-            # 否则「买一张虚拟卡」会被当成理财申购。
-            if re.search(r'申购|入手|购买|(?<!买)买(?!卡)', t):
+            # 但必须排除两类情况，否则会把「询问」误判成「申购」：
+            #
+            #   ① 「买卡」—— 属于卡场景（卡分支在前，本不该到此处，双保险）；
+            #   ② 「可以买」「能买」「买什么」「买哪个」
+            #      —— 这里的「买」是**询问语气**，不是申购。
+            #
+            # 第 ② 类是实测踩到的：「有哪些理财产品可以买」被判成
+            # wealth_purchase，然后因缺金额被追问"请问申购多少元" ——
+            # 而这恰恰是最自然的产品查询说法。判断依据是"列举/疑问"词形，
+            # 不是"买"字本身。
+            is_asking = re.search(r'可以买|能买|买什么|买哪|有哪些|有什么|看看', t)
+            if re.search(r'申购|入手|购买|(?<!买)买(?!卡)', t) and not is_asking:
                 amt = parse_amount_yuan(t)
                 return Intent('wealth_purchase',
                               {'acct': acct, 'amount_yuan': amt,
@@ -453,34 +462,39 @@ class IntentParser:
             return None
 
         acct = self._extract_account(t) or 'A001'
+        wants_order = bool(re.search(r'订|下单|买|鲜花|蛋糕|礼物', t))
+        wants_lock = bool(re.search(r'锁定|预留|冻结(?:一笔|资金)|圈起来|别动', t))
 
         # ── 查计划 ────────────────────────────────────────────────────
-        if re.search(r'有(?:哪些|什么|没有).*(?:计划|安排)|(?<!锁)计划(?:列表|清单)?$|'
-                     r'我的.*(?:联动|计划|安排)', t):
+        if re.search(r'有(?:哪些|什么|没有).*(?:计划|安排)|我的.*(?:联动|计划|安排)', t):
             return Intent('linkage_list', {'acct': acct}, 0.9)
 
-        # ── 锁定资金 ──────────────────────────────────────────────────
-        if re.search(r'锁定|预留|冻结(?:一笔|资金)|圈起来|别动', t) \
-                and not re.search(r'订|买|下单', t):
+        # ── 纯锁定（没有订购意图）→ 单独动作 ──────────────────────────
+        # 判定依据是"有没有订购意图"，不是"有没有订购词"：
+        # 「生日前2天订鲜花蛋糕」也含"订"，但它表达的是**登记一个计划**，
+        # 而不是"现在就下单"。若按词判定，赛题的原句会被错判成立即执行。
+        if wants_lock and not wants_order:
             amt = parse_amount_yuan(t)
             return Intent('linkage_lock',
                           {'acct': acct, 'amount_yuan': amt,
                            'occasion_text': self._extract_occasion(t)}, 0.88)
 
-        # ── 执行到期步骤 ──────────────────────────────────────────────
-        if re.search(r'执行|下单|订(?:购)?|买(?:好|了)|现在(?:就)?办|到期', t) \
-                and re.search(r'鲜花|蛋糕|礼物|步骤|计划', t):
+        # ── 显式要求执行 ──────────────────────────────────────────────
+        if re.search(r'执行|现在(?:就)?(?:订|买|办)|立即(?:订|买)|到期|跑一下', t):
             return Intent('linkage_run',
                           {'acct': acct, 'occasion_text': self._extract_occasion(t)}, 0.85)
 
         # ── 登记计划（默认分支）──────────────────────────────────────
+        # auto_lock：用户在同句里说了"锁定"，说明他要一步到位。
+        # 但锁定本身仍有独立分级（黄色需确认），这里只是把两步串起来。
         amt = parse_amount_yuan(t)
         return Intent('linkage_create',
                       {'acct': acct,
                        'amount_yuan': amt,
                        'occasion_text': self._extract_occasion(t),
                        'person': self._extract_person(t),
-                       'event_date': self._extract_date(t)}, 0.87)
+                       'event_date': self._extract_date(t),
+                       'auto_lock': wants_lock}, 0.87)
 
     def _extract_occasion(self, t):
         """抽出事件类型。目前支持的几类都映射到一个标准事件名。"""

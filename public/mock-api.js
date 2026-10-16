@@ -31,6 +31,12 @@
       '稳健增利 90 天': 500000,
       '货币基金 A': 320000
     },
+    // 锁定金额（分）：为跨场景联动预留。
+    // 与后端一致：**余额不动，只标记不可动用**。
+    // 若把锁定金额从 balances 里扣掉，账实就对不上了。
+    locked: 0,
+    // 联动计划（跨场景联动，赛题场景 6）
+    plans: [],
     dailyOut: 0,
     cardStatus: 'active',
     seq: 0,
@@ -38,10 +44,16 @@
   };
 
   function load() {
+    var st;
     try {
       var s = sessionStorage.getItem('fb-demo-state');
-      return s ? JSON.parse(s) : JSON.parse(JSON.stringify(DEFAULT));
-    } catch (e) { return JSON.parse(JSON.stringify(DEFAULT)); }
+      st = s ? JSON.parse(s) : JSON.parse(JSON.stringify(DEFAULT));
+    } catch (e) { st = JSON.parse(JSON.stringify(DEFAULT)); }
+    // 补新字段的默认值。老版本存下的 sessionStorage 里没有 locked/plans，
+    // 直接用会得到 undefined，参与算术就变成 NaN —— 静默错误，很难查。
+    if (typeof st.locked !== 'number') st.locked = 0;
+    if (!Array.isArray(st.plans)) st.plans = [];
+    return st;
   }
   function save(st) {
     try { sessionStorage.setItem('fb-demo-state', JSON.stringify(st)); } catch (e) {}
@@ -126,6 +138,36 @@
   var PEOPLE = { '李娜': 'A002', '王强': 'A003', '刘敏': 'A004', '张伟': 'A001' };
 
   // 与 bank/core.py 的 WEALTH_CATALOG 保持一致（含起购金额，用于申购校验）
+  // 可动用余额 = 余额 − 锁定。与 Python 侧的 core.available() 同一口径。
+  // 所有花钱的入口都必须用它，否则"锁定"形同虚设。
+  function available() { return ST.balances.A001 - (ST.locked || 0); }
+
+  // 日期工具：以天为粒度做字符串比较即可（YYYY-MM-DD 字典序等于时间序）
+  function todayStr() {
+    var d = new Date();
+    var m = String(d.getMonth() + 1), dd = String(d.getDate());
+    return d.getFullYear() + '-' + (m.length < 2 ? '0' + m : m) +
+           '-' + (dd.length < 2 ? '0' + dd : dd);
+  }
+  function addDays(dateStr, days) {
+    var p = dateStr.split('-');
+    var d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+    d.setDate(d.getDate() + days);
+    var m = String(d.getMonth() + 1), dd = String(d.getDate());
+    return d.getFullYear() + '-' + (m.length < 2 ? '0' + m : m) +
+           '-' + (dd.length < 2 ? '0' + dd : dd);
+  }
+
+  // 跨场景联动的领域常量（与 agent/orchestrator.py 保持一致）
+  // ⚠ 模拟边界：外部订购没有真实供应商接口，返回值带 simulated 标记。
+  var LINKAGE_GIFTS = [
+    { kind: 'order_gift', detail: '订购鲜花', amount: 30000 },
+    { kind: 'order_gift', detail: '订购蛋糕', amount: 20000 }
+  ];
+  var LINKAGE_DEFAULT_BUDGET = 100000;   // 1000 元
+  var LINKAGE_LEAD_DAYS = 2;
+  var LINKAGE_DEFAULT_EVENT_DATE = '2026-06-18';
+
   var WEALTH_CATALOG = [
     { name: '货币基金 A', term: '随时可取', annualized: 0.0185, min_amount: 100, risk: '低' },
     { name: '稳健增利 90 天', term: '90 天', annualized: 0.031, min_amount: 100000, risk: '中低' },
@@ -148,7 +190,10 @@
   function accounts() {
     return [
       { id: 'A001', owner: '张伟', balance: ST.balances.A001,
-        balance_text: YUAN(ST.balances.A001), card_no: '**** **** **** 6222',
+        balance_text: YUAN(ST.balances.A001),
+        locked: ST.locked || 0, locked_text: YUAN(ST.locked || 0),
+        available: available(), available_text: YUAN(available()),
+        card_no: '**** **** **** 6222',
         card_status: ST.cardStatus,
         card_status_text: { active: '正常', frozen: '已冻结', lost: '已挂失' }[ST.cardStatus],
         daily_limit: 5000000, daily_limit_text: '50,000.00' }
@@ -177,16 +222,20 @@
                 { action: 'bill.anomaly', desc: '异常交易识别' },
                 { action: 'wealth.list', desc: '查询理财产品' },
                 { action: 'wealth.holdings', desc: '查询持仓与收益' },
-                { action: 'subscription.list', desc: '查询订阅与代扣' }],
+                { action: 'subscription.list', desc: '查询订阅与代扣' },
+                { action: 'linkage.plan', desc: '登记跨场景联动计划' },
+                { action: 'linkage.list', desc: '查询联动计划' }],
         yellow: [{ action: 'transfer.small', desc: '小额转账' },
                  { action: 'split.request', desc: '发起 AA 收款' },
                  { action: 'subscription.cancel', desc: '取消订阅' },
-                 { action: 'card.apply_virtual', desc: '申请虚拟卡' }],
+                 { action: 'card.apply_virtual', desc: '申请虚拟卡' },
+                 { action: 'linkage.lock', desc: '为联动计划锁定资金' }],
         red: [{ action: 'transfer.large', desc: '大额转账' },
               { action: 'wealth.purchase', desc: '申购理财产品' },
               { action: 'wealth.redeem', desc: '赎回理财产品' },
               { action: 'card.limit_change', desc: '调整卡额度' },
               { action: 'card.freeze', desc: '挂失/冻结卡片' },
+              { action: 'linkage.run', desc: '执行联动步骤（扣款下单）' },
               { action: 'password.change', desc: '修改密码' }]
       },
       rules: { small_transfer_cap: CAP, small_transfer_cap_text: '1000.00' }
@@ -208,6 +257,140 @@
   }
 
   /* ── /api/chat：意图识别 → 分级 → 出计划 ─────────────────────────── */
+  /* ══════════════════ 跨场景联动辅助 ══════════════════ */
+
+  function pad2(x) { x = String(x); return x.length < 2 ? '0' + x : x; }
+
+  function linkOccasion(text) {
+    var table = [
+      [/爱人.*生日|老婆.*生日|先生.*生日|伴侣.*生日/, '爱人生日'],
+      [/(?:爸|妈|父亲|母亲|父母).*生日/, '父母生日'],
+      [/(?:孩子|儿子|女儿|宝宝).*生日/, '子女生日'],
+      [/生日/, '生日'],
+      [/纪念日|结婚纪念/, '纪念日'],
+      [/节日|过节|春节|中秋|端午/, '节日']
+    ];
+    for (var i = 0; i < table.length; i++) {
+      if (table[i][0].test(text)) return table[i][1];
+    }
+    return null;
+  }
+
+  /** 把"那个生日计划"解析成具体计划。
+   *  规则：说了事件名就按名字匹配；没指名且只有一个未完成计划就用它；
+   *  有多个 → 返回 null 让上层追问（挑错计划意味着给错的人订礼物）。 */
+  function pickPlan(occasion) {
+    var open = ST.plans.filter(function (p) {
+      return p.status === 'planned' || p.status === 'locked';
+    });
+    if (occasion) {
+      var hit = open.filter(function (p) {
+        return p.occasion.indexOf(occasion) >= 0 || occasion.indexOf(p.occasion) >= 0;
+      });
+      if (hit.length === 1) return hit[0];
+      if (hit.length > 1) return null;
+    }
+    if (open.length === 1) return open[0];
+    return null;
+  }
+
+  function statusText(s) {
+    return { planned: '已登记（未锁资金）', locked: '已锁定资金',
+             done: '已完成', cancelled: '已取消' }[s] || s;
+  }
+
+  function linkagePlanText(plan) {
+    var lines = ['已登记联动计划 **' + plan.occasion + '**（' + plan.event_date + '）。'];
+    if (plan.person) lines.push('关联人：' + plan.person);
+    lines.push('预算 ' + YUAN(plan.budget) + ' 元，拆成 ' + plan.steps.length + ' 个步骤：');
+    plan.steps.forEach(function (st) {
+      lines.push('· ' + st.detail + ' —— ' + st.due_date + ' 执行，' + YUAN(st.amount) + ' 元');
+    });
+    var tot = plan.steps.reduce(function (a, s) { return a + s.amount; }, 0);
+    if (tot > plan.budget) {
+      lines.push('');
+      lines.push('⚠ 步骤合计 ' + YUAN(tot) + ' 元超过预算 ' + YUAN(plan.budget) + ' 元，请调整预算或步骤。');
+    }
+    lines.push('');
+    lines.push('计划已登记但**尚未锁定资金** —— 钱还能正常使用。');
+    lines.push('（说明：本演示使用默认事件日期 ' + plan.event_date +
+               '。真实使用请明确告知日期，例如「生日是 2026-06-18」。）');
+    return lines.join('\n');
+  }
+
+  function linkageListText() {
+    if (!ST.plans.length) {
+      return '你还没有登记跨场景联动计划。\n' +
+             '可以这样说：「我爱人生日，帮我当月锁定 1000 元」';
+    }
+    var lines = ['你共有 **' + ST.plans.length + ' 个**联动计划（可用余额 ' +
+                 YUAN(available()) + ' 元）：'];
+    ST.plans.forEach(function (p) {
+      lines.push('· **' + p.occasion + '**（' + p.event_date + '）预算 ' +
+                 YUAN(p.budget) + ' 元 · 状态：' + statusText(p.status));
+      p.steps.forEach(function (st) {
+        lines.push('    ' + (st.status === 'done' ? '✓' : '·') + ' ' + st.detail +
+                   '（' + st.due_date + '，' + YUAN(st.amount) + ' 元）');
+      });
+    });
+    return lines.join('\n');
+  }
+
+  function linkageLockCard(plan) {
+    ST.seq++;
+    var opId = 'OP' + ST.seq + 'LLK';
+    logEvent('tier.checked', { action: 'linkage.lock', tier: 'yellow' });
+    logEvent('confirm.issued', { op: opId, tier: 'yellow' });
+    return {
+      type: 'confirm_required', tier: 'yellow', tier_label: fmtTier('yellow'),
+      op_id: opId, action: 'linkage.lock',
+      summary: '为「' + plan.occasion + '」锁定 ' + YUAN(plan.budget) + ' 元',
+      reasons: ['为联动计划锁定资金 的基准级别：黄色 · 需确认',
+                '钱仍在账户内，但期间不能用于转账/理财 —— 可逆，故为黄色而非红色'],
+      needs: ['user_confirmation'],
+      confirm_token: 'STATIC-' + opId, expires_in: 180,
+      details: [{ label: '账户', value: 'A001' },
+                { label: '计划', value: plan.occasion },
+                { label: '锁定金额', value: YUAN(plan.budget) + ' 元' },
+                { label: '影响', value: '这笔钱仍在你账户里，但期间不能用于转账/理财' }],
+      _planId: plan.id, _side: 'linkage_lock',
+      intent: { intent: 'linkage_lock', confidence: 0.88,
+                slots: { acct: 'A001', plan_id: plan.id } }
+    };
+  }
+
+  function linkageRunCard(plan) {
+    ST.seq++;
+    var opId = 'OP' + ST.seq + 'LRN';
+    var today = todayStr();
+    var due = plan.steps.filter(function (s) {
+      return s.status === 'pending' && s.due_date <= today;
+    });
+    logEvent('tier.checked', { action: 'linkage.run', tier: 'red' });
+    logEvent('confirm.issued', { op: opId, tier: 'red' });
+    return {
+      type: 'confirm_required', tier: 'red', tier_label: fmtTier('red'),
+      op_id: opId, action: 'linkage.run',
+      summary: '执行「' + plan.occasion + '」的到期步骤',
+      reasons: ['执行联动步骤（扣款下单） 的基准级别：红色 · 需强验证',
+                '资金离账且不可逆（礼品已订），需多因子认证'],
+      needs: ['user_confirmation', 'strong_verification'],
+      requires_strong: true,
+      confirm_token: 'STATIC-' + opId, expires_in: 180,
+      details: [{ label: '账户', value: 'A001' },
+                { label: '计划', value: plan.occasion },
+                { label: '今天', value: today },
+                { label: '本次到期步骤',
+                  value: due.map(function (s) { return s.detail; }).join('、') || '无' },
+                { label: '本次扣款',
+                  value: YUAN(due.reduce(function (a, s) { return a + s.amount; }, 0)) + ' 元' },
+                { label: '外部订购', value: '模拟（无真实供应商接口）' }],
+      _planId: plan.id, _side: 'linkage_run',
+      intent: { intent: 'linkage_run', confidence: 0.85,
+                slots: { acct: 'A001', plan_id: plan.id } }
+    };
+  }
+
   function handleChat(body) {
     var text = (body.text || '').trim();
     logEvent('intent.parsed', { text: text });
@@ -284,10 +467,25 @@
     }
     // 列举类问法不能进操作分支。「我有哪些理财」含「理财」二字，
     // 若不排除就会被当成申购、然后因缺金额被追问，与用户意图相反。
-    var isListing = /有哪些|有什么|看看|列表|持有哪些|哪个好/.test(text)
-                    && !/买|申购|购买|赎回|取出|卖掉/.test(text);
-    var hasOp = /买|申购|购买|赎回|取出|卖掉/.test(text);
-    if ((hasOp || (product && !isListing)) && !isListing) {
+    // 「可以买」「能买」「买什么」「买哪」也是询问语气，必须与申购区分开。
+    // 实测：「有哪些理财产品可以买」曾被判成申购，然后因缺金额被追问 ——
+    // 而这恰恰是最自然的产品查询说法。
+    // 只按"列举/疑问"词形判断，**不加** "且不含操作动词" 这个条件。
+    // 踩过的坑：原先写成
+    //     /有哪些|可以买|.../ .test(text) && !/买|申购|.../.test(text)
+    // 对「有哪些理财产品可以买」判为 false —— 因为它同时含"有哪些"和"可以买"，
+    // 而"可以买"里就有个"买"字。于是这句**询问**被判成申购，追问"申购多少元"。
+    // "可以买"的"买"与"买 2000 元"的"买"字面相同、语义不同，
+    // 区分依据只能是疑问词形，不能是操作动词存在与否。
+    var isListing = /有哪些|有什么|看看|列表|持有哪些|哪个好|可以买|能买|买什么|买哪/.test(text);
+    // 卡相关说法不走理财分支。
+    // Python 侧靠「卡分支排在理财之前」解决，但本文件的理财块是后加进去的、
+    // 排在卡块之前 —— 两侧顺序不一致，行为就会分叉
+    // （实测「买一张虚拟卡」在 Python 侧正确、在静态版被当成申购）。
+    // 与其重排（改动面大），不如在进入条件上显式排除。
+    var isCardTalk = /卡/.test(text);
+    var hasOp = /申购|购买|赎回|取出|卖掉|(?:买)(?!什么|哪)/.test(text);
+    if ((hasOp || (product && !isListing)) && !isListing && !isCardTalk) {
       var wamt = amount(text);
       if (/赎回|取出|卖掉/.test(text)) {
         // 未指名产品时，只在持仓唯一的情况下补全；多个持仓不猜
@@ -360,7 +558,136 @@
         intent: { intent: 'wealth_list', confidence: 0.9, slots: { acct: 'A001' } } };
     }
 
-    // 5. 改额度
+    // 4b. 跨场景联动（赛题场景 6）
+    // 放在这里的原因：它在语义上是"理财/转账之外的一类计划"，
+    // 但必须在转账分支之前 —— 否则"订鲜花"里的"买/订"会被转账的
+    // 金额规则吃掉。与 Python 侧 _p_linkage 的排序位置一致。
+    var LINK_KEY = /生日|纪念日|节日|送礼|礼物|鲜花|蛋糕|联动|提前准备|备忘/;
+    if (LINK_KEY.test(text)) {
+      var wantsOrder = /订|下单|买|鲜花|蛋糕|礼物/.test(text);
+      var wantsLock = /锁定|预留|冻结|圈起来|别动/.test(text);
+
+      // 查计划
+      if (/有(?:哪些|什么|没有).*(?:计划|安排)|我的.*(?:联动|计划|安排)/.test(text)) {
+        logEvent('tier.checked', { action: 'linkage.list', tier: 'green' });
+        return { type: 'result', tier: 'green', tier_label: fmtTier('green'),
+          auto_executed: true,
+          message: linkageListText(),
+          data: { plans: ST.plans, available: available() },
+          intent: { intent: 'linkage_list', confidence: 0.9, slots: { acct: 'A001' } } };
+      }
+
+      var occasion = linkOccasion(text) || '生日';
+      var person = (text.match(/(爱人|老婆|老公|先生|太太|伴侣|爸爸|妈妈|父亲|母亲|儿子|女儿|孩子|宝宝)/) || [])[1] || null;
+
+      // 纯锁定（无订购意图）→ 单独动作
+      if (wantsLock && !wantsOrder) {
+        var lockPlan = pickPlan(occasion);
+        if (!lockPlan) {
+          return { type: 'clarify',
+            message: '没找到要锁定资金的计划。可以先说「我爱人生日，帮我准备一下」登记一个。',
+            intent: { intent: 'linkage_lock', confidence: 0.8, slots: {} } };
+        }
+        return linkageLockCard(lockPlan);
+      }
+
+      // 显式执行
+      if (/执行|现在(?:就)?(?:订|买|办)|立即(?:订|买)|到期|跑一下/.test(text)) {
+        var runPlan = pickPlan(occasion);
+        if (!runPlan) {
+          return { type: 'clarify', message: '没找到要执行的计划，请说明是哪一个。',
+            intent: { intent: 'linkage_run', confidence: 0.8, slots: {} } };
+        }
+        return linkageRunCard(runPlan);
+      }
+
+      // 登记计划
+      var ev = '2026-06-18';
+      var md = text.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+      if (md) ev = md[1] + '-' + pad2(md[2]) + '-' + pad2(md[3]);
+      var budgetYuan = amount(text) === null ? 1000 : amount(text);
+      var budget = Math.round(budgetYuan * 100);
+      var due = addDays(ev, -LINKAGE_LEAD_DAYS);
+      var plan = {
+        id: 'LP' + sha256Sync('plan' + Date.now() + ST.plans.length).slice(0, 12).toUpperCase(),
+        occasion: occasion, person: person, event_date: ev, budget: budget,
+        locked: 0, status: 'planned',
+        steps: LINKAGE_GIFTS.map(function (g, i) {
+          return { id: 'LS' + i, seq: i, kind: g.kind,
+                   detail: g.detail + '（' + ev + ' 前 ' + LINKAGE_LEAD_DAYS + ' 天）',
+                   amount: g.amount, due_date: due, status: 'pending' };
+        })
+      };
+      ST.plans.push(plan);
+      save(ST);
+      logEvent('tier.checked', { action: 'linkage.plan', tier: 'green' });
+      logEvent('exec.green_plan', { plan: plan.id, occasion: occasion });
+      var card = { type: 'result', tier: 'green', tier_label: fmtTier('green'),
+        auto_executed: true, message: linkagePlanText(plan),
+        data: { plan: plan, available: available() },
+        intent: { intent: 'linkage_create', confidence: 0.87,
+                  slots: { acct: 'A001', occasion_text: occasion, person: person,
+                           event_date: ev, budget: budget } } };
+      // 同句说了"锁定" → 链接一张黄色确认卡。
+      // 不顺手锁掉：锁定会让钱不能动用，必须让用户单独确认一次。
+      if (wantsLock) card.chained = linkageLockCard(plan);
+      return card;
+    }
+
+    // 5. 卡操作（申请虚拟卡 / 挂失 / 解挂）
+    //
+    // 这三个分支原先**根本没实现** —— 而卡片管理是赛题的六个场景之一。
+    // 结果是线上 demo 里说「申请一张虚拟卡」会走到"没听懂"。
+    // 静态版与 Python 后端的行为必须一致，缺哪个场景都会在演示时暴露。
+    if (/挂失|冻结|锁卡|丢卡|卡片丢失/.test(text)) {
+      logEvent('tier.checked', { action: 'card.freeze', tier: 'red' });
+      ST.seq++;
+      return { type: 'confirm_required', tier: 'red', tier_label: fmtTier('red'),
+        op_id: 'OP' + ST.seq + 'CFR', action: 'card.freeze',
+        summary: '挂失并冻结卡片',
+        reasons: ['挂失/冻结卡片 的基准级别：红色 · 需强验证',
+                  '该操作不可逆，且影响卡片全部交易'],
+        needs: ['user_confirmation', 'strong_verification'],
+        confirm_token: 'STATIC-CFR', expires_in: 180,
+        details: [{ label: '账户', value: 'A001' },
+                  { label: '影响', value: '卡片将无法用于任何交易' },
+                  { label: '当前状态', value: { active: '正常', frozen: '已冻结', lost: '已挂失' }[ST.cardStatus] }],
+        _card: 'freeze',
+        intent: { intent: 'card_freeze', confidence: 0.93, slots: { acct: 'A001' } } };
+    }
+    if (/解挂|解冻|恢复用卡/.test(text)) {
+      logEvent('tier.checked', { action: 'card.unfreeze', tier: 'red' });
+      ST.seq++;
+      return { type: 'confirm_required', tier: 'red', tier_label: fmtTier('red'),
+        op_id: 'OP' + ST.seq + 'CUF', action: 'card.unfreeze',
+        summary: '解除卡片挂失状态',
+        reasons: ['卡片解挂 的基准级别：红色 · 需强验证',
+                  '恢复用卡属于高风险操作'],
+        needs: ['user_confirmation', 'strong_verification'],
+        confirm_token: 'STATIC-CUF', expires_in: 180,
+        details: [{ label: '账户', value: 'A001' },
+                  { label: '当前状态', value: { active: '正常', frozen: '已冻结', lost: '已挂失' }[ST.cardStatus] }],
+        _card: 'unfreeze',
+        intent: { intent: 'card_unfreeze', confidence: 0.9, slots: { acct: 'A001' } } };
+    }
+    if (/虚拟卡|新卡|开卡|办卡|申请卡|办一张卡|买\s*一?\s*张?\s*卡/.test(text)) {
+      logEvent('tier.checked', { action: 'card.apply_virtual', tier: 'yellow' });
+      ST.seq++;
+      return { type: 'confirm_required', tier: 'yellow', tier_label: fmtTier('yellow'),
+        op_id: 'OP' + ST.seq + 'CAP', action: 'card.apply_virtual',
+        summary: '申请一张虚拟卡',
+        reasons: ['申请虚拟卡 的基准级别：黄色 · 需确认',
+                  '有副作用但可撤销，无需强验证'],
+        needs: ['user_confirmation'],
+        confirm_token: 'STATIC-CAP', expires_in: 180,
+        details: [{ label: '账户', value: 'A001' },
+                  { label: '卡片类型', value: '虚拟卡' },
+                  { label: '额度', value: '与主卡一致' }],
+        _card: 'apply',
+        intent: { intent: 'card_apply_virtual', confidence: 0.9, slots: { acct: 'A001' } } };
+    }
+
+    // 6. 改额度
     if (/额度|限额|提额/.test(text)) {
       var lim = amount(text);
       var limDetail = lim === null
@@ -467,6 +794,171 @@
                  '这一条在完整版里会写入 account.daily_limit。）' };
     }
 
+    // ── 跨场景联动：锁定资金（黄色，只确认，不需强验证）──────────────
+    if (body._side === 'linkage_lock') {
+      var lkPlan = null;
+      for (var li = 0; li < ST.plans.length; li++) {
+        if (ST.plans[li].id === body._planId) { lkPlan = ST.plans[li]; break; }
+      }
+      logEvent('confirm.checked', { op: opId, phase: 'execute', tier: 'yellow' });
+      if (!lkPlan) {
+        return { type: 'exec_failed', code: 'PLAN_NOT_FOUND',
+          message: '找不到这个联动计划。' };
+      }
+      if (lkPlan.locked > 0) {
+        return { type: 'result', data: { plan: lkPlan, locked: lkPlan.locked },
+          message: '这笔锁定已存在，按幂等处理，**没有重复锁定**。' };
+      }
+      // 校验可动用余额 —— 与后端 core.lock_funds 一致：
+      // 不能用 balance 判断，否则会超额锁定，把账户锁穿。
+      if (available() < lkPlan.budget) {
+        return { type: 'exec_failed', code: 'INSUFFICIENT_AVAILABLE',
+          message: '可动用余额不足：可动用 ' + YUAN(available()) + ' 元（余额 ' +
+                   YUAN(ST.balances.A001) + ' − 已锁定 ' + YUAN(ST.locked || 0) +
+                   '），本计划需要 ' + YUAN(lkPlan.budget) + ' 元' };
+      }
+      ST.locked = (ST.locked || 0) + lkPlan.budget;
+      lkPlan.locked = lkPlan.budget;
+      lkPlan.status = 'locked';
+      save(ST);
+      logEvent('confirm.consumed', { op: opId });
+      logEvent('exec.succeeded', { op: opId, action: 'linkage.lock',
+                                   amount: lkPlan.budget });
+      return { type: 'result', tier: 'yellow', tier_label: fmtTier('yellow'),
+        data: { plan: lkPlan, locked: lkPlan.locked, balance: ST.balances.A001,
+                available: available() },
+        message: '已为「' + lkPlan.occasion + '」锁定 **' + YUAN(lkPlan.budget) +
+                 ' 元**。余额仍是 ' + YUAN(ST.balances.A001) + ' 元，其中 ' +
+                 YUAN(lkPlan.budget) + ' 元现在不能动用（可动用 ' +
+                 YUAN(available()) + ' 元）。' };
+    }
+
+    // ── 跨场景联动：执行到期步骤（红色，需强验证）────────────────────
+    if (body._side === 'linkage_run') {
+      var rnPlan = null;
+      for (var ri = 0; ri < ST.plans.length; ri++) {
+        if (ST.plans[ri].id === body._planId) { rnPlan = ST.plans[ri]; break; }
+      }
+      logEvent('confirm.checked', { op: opId, phase: 'execute', tier: 'red' });
+      if (!rnPlan) {
+        return { type: 'exec_failed', code: 'PLAN_NOT_FOUND',
+          message: '找不到这个联动计划。' };
+      }
+      if (!code) {
+        return { type: 'need_strong_verification',
+          message: '这是红色级别操作，需要短信验证码确认。', op_id: opId,
+          hint: '确认凭证仍然有效，获取验证码后继续即可，不需要重新发起。' };
+      }
+      if (code !== ISSUED_CODE) {
+        logEvent('verify.rejected', { op: opId, reason: '验证码不正确' });
+        return { type: 'refused', message: '验证码不正确', op_id: opId,
+                 retryable: true };
+      }
+      logEvent('verify.passed', { op: opId, method: 'sms_otp' });
+
+      // 必须先锁定资金 —— 与后端 core.execute_step 同一条约束：
+      // 不允许动用未预留的余额去下单。
+      if (!rnPlan.locked || rnPlan.locked <= 0) {
+        return { type: 'exec_failed', code: 'NOT_LOCKED',
+          message: '该计划还没有锁定资金，不能执行扣款步骤。请先确认锁定 ' +
+                   YUAN(rnPlan.budget) + ' 元。' };
+      }
+
+      var today = todayStr();
+      var dueSteps = rnPlan.steps.filter(function (s) {
+        return s.status === 'pending' && s.due_date <= today;
+      });
+      if (!dueSteps.length) {
+        var pend = rnPlan.steps.filter(function (s) { return s.status === 'pending'; });
+        if (!pend.length) {
+          return { type: 'result', message: '该计划的步骤都已执行完毕。' };
+        }
+        var nxt = pend.map(function (s) { return s.due_date; }).sort()[0];
+        return { type: 'exec_failed', code: 'NOT_DUE',
+          message: '该计划还没有到期的步骤。最近一步应在 ' + nxt + ' 执行，今天是 ' +
+                   today + '。提前执行会打乱时序，已拒绝。' };
+      }
+      logEvent('confirm.consumed', { op: opId });
+      var done = [], totalAmt = 0;
+      for (var di = 0; di < dueSteps.length; di++) {
+        var s = dueSteps[di];
+        if (s.amount > ST.balances.A001) {
+          return { type: 'exec_failed', code: 'INSUFFICIENT_FUNDS',
+            message: '余额不足以执行「' + s.detail + '」：可用 ' +
+                     YUAN(ST.balances.A001) + ' 元，需要 ' + YUAN(s.amount) + ' 元' };
+        }
+        ST.balances.A001 -= s.amount;
+        // 锁定金额按实际花费释放，不超过本计划剩余锁定额
+        var rel = Math.min(s.amount, rnPlan.locked);
+        ST.locked = Math.max(0, (ST.locked || 0) - rel);
+        rnPlan.locked -= rel;
+        s.status = 'done';
+        totalAmt += s.amount;
+        done.push({ kind: s.kind, detail: s.detail, amount: s.amount });
+        logEvent('exec.succeeded', { op: opId, action: 'linkage.run',
+                                     step: s.id, amount: s.amount });
+      }
+      var left = rnPlan.steps.filter(function (x) { return x.status !== 'done'; }).length;
+      if (!left) {
+        // 所有步骤完成 → 释放剩余锁定
+        ST.locked = Math.max(0, (ST.locked || 0) - rnPlan.locked);
+        rnPlan.locked = 0;
+        rnPlan.status = 'done';
+      }
+      save(ST);
+      var msg = '已执行 ' + done.length + ' 个到期步骤：\n';
+      done.forEach(function (d) {
+        msg += '· ' + d.detail + ' —— ' + YUAN(d.amount) + ' 元\n';
+      });
+      msg += '\n账户余额 ' + YUAN(ST.balances.A001) + ' 元，其中已锁定 ' +
+             YUAN(ST.locked || 0) + ' 元，可动用 ' + YUAN(available()) + ' 元。';
+      // 模拟边界必须明说，不能让人以为真的下单了
+      msg += '\n\n⚠ **外部订购为模拟**：本项目没有真实的鲜花/蛋糕供应商接口，' +
+             '这里只演示「资金到位 + 时序触发」这条链路。';
+      return { type: 'result', tier: 'red', tier_label: fmtTier('red'),
+        data: { plan: rnPlan, executed: done, balance: ST.balances.A001,
+                locked: ST.locked || 0, available: available() },
+        message: msg };
+    }
+
+    // 卡操作（申请虚拟卡 / 挂失 / 解挂）
+    if (body._card) {
+      var ck = body._card;
+      // 只有挂失/解挂是红级；申请虚拟卡是黄级，不需要验证码
+      var ckRed = (ck === 'freeze' || ck === 'unfreeze');
+      logEvent('confirm.checked', { op: opId, phase: 'execute', tier: ckRed ? 'red' : 'yellow' });
+      if (ckRed) {
+        if (!code) {
+          return { type: 'need_strong_verification',
+            message: '这是红色级别操作，需要短信验证码确认。', op_id: opId,
+            hint: '确认凭证仍然有效，获取验证码后继续即可，不需要重新发起。' };
+        }
+        if (code !== ISSUED_CODE) {
+          logEvent('verify.rejected', { op: opId, reason: '验证码不正确' });
+          return { type: 'refused', message: '验证码不正确', op_id: opId, retryable: true };
+        }
+        logEvent('verify.passed', { op: opId, method: 'sms_otp' });
+      }
+      logEvent('confirm.consumed', { op: opId });
+      if (ck === 'freeze') {
+        ST.cardStatus = 'lost';
+        save(ST);
+        logEvent('exec.succeeded', { op: opId, action: 'card.freeze' });
+        return { type: 'result', tier: 'red', tier_label: fmtTier('red'),
+          message: '卡片已挂失冻结。如需恢复用卡，请通过人脸识别验证身份后解挂。' };
+      }
+      if (ck === 'unfreeze') {
+        ST.cardStatus = 'active';
+        save(ST);
+        logEvent('exec.succeeded', { op: opId, action: 'card.unfreeze' });
+        return { type: 'result', tier: 'red', tier_label: fmtTier('red'),
+          message: '卡片已解挂，恢复使用。' };
+      }
+      logEvent('exec.succeeded', { op: opId, action: 'card.apply_virtual' });
+      return { type: 'result', tier: 'yellow', tier_label: fmtTier('yellow'),
+        message: '虚拟卡申请已提交，状态：待审核。' };
+    }
+
     // 理财申赎
     if (body._side === 'purchase' || body._side === 'redeem') {
       var wp = body._product, wa = body._amount || 0;
@@ -493,9 +985,13 @@
           return { type: 'exec_failed', code: 'BELOW_MIN_AMOUNT',
             message: '低于起购金额：' + YUAN(spec.min_amount) + ' 起购，本次 ' + YUAN(wa) };
         }
-        if (ST.balances.A001 < wa) {
+        // 用可动用余额判断 —— 被联动计划锁定的钱不能拿去申购理财。
+        // 与后端 core.purchase 的检查口径一致。
+        if (available() < wa) {
           return { type: 'exec_failed', code: 'INSUFFICIENT_FUNDS',
-            message: '活期余额不足：可用 ' + YUAN(ST.balances.A001) + ' 元，需要 ' + YUAN(wa) + ' 元' };
+            message: '活期可用余额不足：可用 ' + YUAN(available()) + ' 元，需要 ' + YUAN(wa) +
+                     ' 元' + ((ST.locked || 0) > 0
+                       ? '（其中 ' + YUAN(ST.locked) + ' 元已为联动计划锁定）' : '') };
         }
         ST.balances.A001 -= wa;
         ST.holdings[wp] = (ST.holdings[wp] || 0) + wa;
@@ -552,10 +1048,15 @@
     logEvent('confirm.consumed', { op: opId });
 
     var to = body.to_acct || 'A002';
-    if (ST.balances.A001 < cents) {
+    // 同样按可动用余额判断：为联动计划预留的钱不能被转走，
+    // 否则到期该订的礼品就付不出钱了 —— 预留形同虚设。
+    if (available() < cents) {
       logEvent('exec.failed', { op: opId, code: 'INSUFFICIENT_FUNDS' });
       return { type: 'exec_failed', code: 'INSUFFICIENT_FUNDS',
-        message: '余额不足：可用 ' + YUAN(ST.balances.A001) + ' 元，需要 ' + YUAN(cents) + ' 元' };
+        message: '可动用余额不足：可用 ' + YUAN(available()) + ' 元，需要 ' + YUAN(cents) +
+                 ' 元' + ((ST.locked || 0) > 0
+                   ? '（余额 ' + YUAN(ST.balances.A001) + ' 元中另有 ' +
+                     YUAN(ST.locked) + ' 元已为联动计划锁定）' : '') };
     }
     ST.balances.A001 -= cents;
     ST.balances[to] = (ST.balances[to] || 0) + cents;
@@ -615,12 +1116,19 @@
       body._wasRed = window.__lastOp.tier === 'red';
       body._product = window.__lastOp._product;
       body._side = window.__lastOp._side;
+      body._card = window.__lastOp._card;
+      body._planId = window.__lastOp._planId;
       body.to_acct = (window.__lastOp._payee || {}).acct;
       body.to_name = (window.__lastOp._payee || {}).name;
     }
     var res = fn(body || {});
-    if (path === '/api/chat' && res.type === 'confirm_required') {
-      window.__lastOp = res;
+    // 记住"上一次待确认的操作"，供 /api/execute 取用。
+    // 链接卡（chained）也要记 —— 它是"登记计划"返回值里的**嵌套**确认卡，
+    // 用户点它时 op 不在 res 顶层。漏了这一句的表现是"链接卡点了没反应"，
+    // 而且不会有任何报错，很难查。
+    if (path === '/api/chat') {
+      if (res.type === 'confirm_required') window.__lastOp = res;
+      else if (res.chained) window.__lastOp = res.chained;
     }
     return res;
   };
