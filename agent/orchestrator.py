@@ -31,7 +31,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bank.core import (BankError, yuan_to_cents, cents_to_yuan,
-                        WEALTH_CATALOG)
+                        WEALTH_CATALOG, add_days, _today_str)
 from security.permissions import (
     check_tier, payload_hash, ConfirmationStore, CircuitBreaker,
     GREEN, YELLOW, RED, TIER_LABEL, ACTIONS,
@@ -56,6 +56,10 @@ INTENT_ACTION = {
     'card_freeze':          'card.freeze',
     'card_unfreeze':        'card.unfreeze',
     'card_limit_change':    'card.limit_change',
+    'linkage_create':       'linkage.plan',
+    'linkage_list':         'linkage.list',
+    'linkage_lock':         'linkage.lock',
+    'linkage_run':          'linkage.run',
     'transfer':             'transfer.small',   # 具体级别由金额动态抬升
     'split_request':        'split.request',
 }
@@ -114,6 +118,55 @@ def detect_injection(text):
     return hits
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 跨场景联动的领域常量
+# ══════════════════════════════════════════════════════════════════════
+# ⚠ 模拟边界：外部订购（鲜花、蛋糕）**没有真实供应商接口**。
+# 下面这些是演示用的价目，`execute_step` 返回里会带 simulated=True。
+# 这一点在文档、界面与答辩中都必须明说，不能宣称"真的下单成功"。
+LINKAGE_GIFTS = [
+    {'kind': 'order_gift', 'detail': '订购鲜花', 'amount': yuan_to_cents(300.00)},
+    {'kind': 'order_gift', 'detail': '订购蛋糕', 'amount': yuan_to_cents(200.00)},
+]
+
+# 默认预算 = 1000 元。赛题原句就是"当月锁定 1000 元"。
+LINKAGE_DEFAULT_BUDGET = 1000.00
+
+# 提前几天执行。赛题原句是"生日前 2 天"。
+LINKAGE_LEAD_DAYS = 2
+
+# 演示用默认事件日期。
+# 为什么不追问日期：这是个演示项目，"我把我爱人生日是哪天告诉你"这一步
+# 会把演示拖长，而日期本身不影响任何安全属性。所以给一个明确的默认值，
+# 并在返回值里**如实说明用的是默认日期**，让用户知道可以纠正。
+# 真实产品必须让用户确认这个日期 —— 记错生日会真的错过。
+LINKAGE_DEFAULT_EVENT_DATE = '2026-06-18'
+
+
+def build_linkage_steps(event_date):
+    """把一次事件拆成**有序步骤 DAG**。
+
+    这是"任务规划"落地的地方 —— 一句"生日前 2 天订鲜花蛋糕"
+    要被拆成两步有明确到期日的动作，而不是一条笼统的提醒。
+
+    抽成模块级函数是为了**可单测**：测试要能直接验证"到期日算得对不对"，
+    而不必先跑一遍自然语言解析。计划正确性依赖于日期算术，
+    日期算错的后果是"该订的时候没订"，属于静默故障。
+    """
+    due = add_days(event_date, -LINKAGE_LEAD_DAYS)
+    steps = []
+    for i, g in enumerate(LINKAGE_GIFTS):
+        steps.append({
+            'seq': i,
+            'kind': g['kind'],
+            'detail': '%s（%s 前 %d 天）' % (g['detail'], event_date,
+                                         LINKAGE_LEAD_DAYS),
+            'amount': g['amount'],
+            'due_date': due,
+        })
+    return steps
+
+
 class PendingOperation:
     """一个等待用户确认/验证的操作。"""
     def __init__(self, action, params, tier_info, idem_key, summary):
@@ -129,7 +182,8 @@ class PendingOperation:
 class AgentSession:
     """一个用户会话。状态：待确认操作、确认凭证、熔断计数。"""
 
-    def __init__(self, core, audit, confirm_store, breaker, session_id=None):
+    def __init__(self, core, audit, confirm_store, breaker, session_id=None,
+                 today=None):
         self.core = core
         self.audit = audit
         self.confirm = confirm_store
@@ -139,6 +193,13 @@ class AgentSession:
         self.pending = {}          # op_id -> PendingOperation
         self.last_result = None
         self.turn = 0
+        # 可注入的"今天"。跨场景联动的到期判定靠它，测试时传固定日期，
+        # 否则测试结果会随运行当天变化 —— 今天绿、明天红那种不稳定最难查。
+        # 传 None 表示用真实系统时间。
+        self.today = today
+
+    def _now_date(self):
+        return self.today or _today_str()
 
     # ══════════════════════════════════════════════════════════════════
     # 阶段一：理解 + 分级 + 出计划
@@ -244,7 +305,18 @@ class AgentSession:
         if tier == GREEN:
             self.audit.append('exec.auto_green', session_id=self.id, action=action)
             result = self._dispatch(action, params)
-            return self._wrap_readonly_result(intent, result, tier_info)
+            wrapped = self._wrap_readonly_result(intent, result, tier_info)
+            # 登记计划后若用户在同一句里说了"锁定"，**链接一张锁定确认卡**。
+            #
+            # 为什么是"链接"而不是顺手锁掉：
+            # 锁定是黄色动作（钱会变得不能动用），必须让用户单独确认一次。
+            # 不能因为他在一句话里提过"锁定"就替他决定 —— 那正是
+            # "判定与执行各算一遍"的翻版：这里把用户的**意图**当成了**授权**。
+            if action == 'linkage.plan' and result.get('auto_lock'):
+                chain = self._issue_lock_card(params['acct'])
+                if chain:
+                    wrapped['chained'] = chain
+            return wrapped
 
         # ── 黄色 / 红色：生成计划，等确认 ──────────────────────────
         op = PendingOperation(action, params, tier_info, idem_key,
@@ -428,6 +500,11 @@ class AgentSession:
                 miss.append('amount')
         elif intent.name == 'subscription_cancel_need_merchant':
             miss.append('merchant')
+        elif intent.name == 'linkage_create':
+            # 事件是必需的："帮我准备一下"没说给谁过什么日子，猜不出来。
+            # 日期**不追问** —— 见 _build_params 里的默认日期说明。
+            if not s.get('occasion_text'):
+                miss.append('occasion')
         return miss
 
     def _ask_for(self, missing, intent):
@@ -452,6 +529,9 @@ class AgentSession:
         if 'product' in missing:
             return ('你想操作哪一个理财产品？你当前持有的产品可以用'
                     '「我有哪些理财」查看。')
+        if 'occasion' in missing:
+            return ('这是要准备什么日子？比如「我爱人生日」「结婚纪念日」。'
+                    '说清楚事件我才能推算该提前几天准备。')
         if 'amount' in missing and 'product' not in missing:
             return '请问金额是多少？'
         return '我还缺一点信息才能继续。'
@@ -516,10 +596,87 @@ class AgentSession:
             if lv is not None:
                 params['limit'] = yuan_to_cents(lv)
 
+        # ── 跨场景联动 ────────────────────────────────────────────────
+        elif action == 'linkage.plan':
+            params.update(self._build_linkage_plan(s, acct))
+
+        elif action == 'linkage.lock':
+            # 锁定哪个计划：优先用户指定的，否则取唯一一个可锁的计划
+            plan = self._resolve_plan(s, acct)
+            params['plan_id'] = plan['id'] if plan else None
+            lv = s.get('amount_yuan')
+            if lv is not None:
+                params['amount'] = yuan_to_cents(lv)
+
+        elif action == 'linkage.run':
+            params['plan_id'] = self._resolve_plan_id(s, acct)
+            params['today'] = s.get('today') or self._now_date()
+
+        elif action == 'linkage.list':
+            params['status'] = s.get('status')
+
         if intent.name == 'bill_analyze':
             params['period'] = s.get('period', 'month')
 
         return params
+
+    def _resolve_plan_id(self, slots, acct):
+        plan = self._resolve_plan(slots, acct)
+        return plan['id'] if plan else None
+
+    def _resolve_plan(self, slots, acct):
+        """把"那个生日计划"这类指代解析成一个具体计划。
+
+        规则：
+          1. 用户给了 plan_id → 直接用；
+          2. 说了事件名 → 按事件名匹配该账户下未完成的计划；
+          3. 没指名且**只有一个**未完成计划 → 用它；
+          4. 有多个 → 返回 None，让上层追问（不能随便挑一个，
+             挑错计划意味着给错的人订礼物）。
+        """
+        pid = slots.get('plan_id')
+        if pid:
+            try:
+                return self.core.get_plan(pid)
+            except BankError:
+                return None
+
+        plans = [p for p in self.core.list_plans(acct)
+                 if p['status'] in ('planned', 'locked')]
+        occ = slots.get('occasion_text')
+        if occ:
+            hit = [p for p in plans if occ in p['occasion'] or p['occasion'] in occ]
+            if len(hit) == 1:
+                return hit[0]
+            if len(hit) > 1:
+                return None
+        if len(plans) == 1:
+            return plans[0]
+        return None
+
+    def _build_linkage_plan(self, s, acct):
+        """从意图槽位构造联动计划：预算 + **有序步骤 DAG**。
+
+        这是"任务规划"落地的地方 —— 一句"生日前 2 天订鲜花蛋糕"
+        要被拆成两步有明确到期日的动作，而不是一条笼统的提醒。
+        """
+        event_date = s.get('event_date') or LINKAGE_DEFAULT_EVENT_DATE
+        budget_yuan = s.get('amount_yuan') or LINKAGE_DEFAULT_BUDGET
+        budget = yuan_to_cents(budget_yuan)
+        steps = build_linkage_steps(event_date)
+        total = sum(x['amount'] for x in steps)
+        return {
+            'occasion': s.get('occasion_text') or '生日',
+            'person': s.get('person'),
+            'event_date': event_date,
+            'event_date_is_default': not bool(s.get('event_date')),
+            'budget': budget,
+            'budget_yuan': budget_yuan,
+            'steps': steps,
+            'steps_total': total,
+            'auto_lock': bool(s.get('auto_lock')),
+            'acct': acct,
+        }
 
     def _dispatch(self, action, params, idem_key=None):
         """真正执行。**这是唯一调用核心的地方。**"""
@@ -608,7 +765,91 @@ class AgentSession:
             self.core.conn.execute('UPDATE account SET daily_limit=? WHERE id=?', (limit, acct))
             return {'daily_limit': limit}
 
+        # ── 跨场景联动 ────────────────────────────────────────────────
+        if action == 'linkage.list':
+            plans = self.core.list_plans(acct, params.get('status'))
+            return {'plans': plans, 'available': self.core.available(acct)}
+
+        if action == 'linkage.plan':
+            return self._dispatch_linkage_plan(params)
+
+        if action == 'linkage.lock':
+            pid = params.get('plan_id')
+            if not pid:
+                raise BankError('NO_PLAN',
+                                '没找到要锁定资金的计划。可以先说'
+                                '「我爱人生日，帮我准备一下」登记一个。')
+            if not idem_key:
+                raise BankError('MISSING_IDEM_KEY', '内部错误：缺少幂等键')
+            r = self.core.lock_funds(pid, idem_key)
+            plan = self.core.get_plan(pid)
+            r['plan'] = plan
+            r['available'] = self.core.available(acct)
+            return r
+
+        if action == 'linkage.run':
+            pid = params.get('plan_id')
+            if not pid:
+                raise BankError('NO_PLAN', '没找到要执行的计划，请说明是哪一个。')
+            return self._dispatch_linkage_run(pid, params)
+
         raise BankError('NOT_IMPLEMENTED', '动作 %s 尚未实现' % action)
+
+    # ── 联动计划：登记（含 DAG 构造）────────────────────────────────────
+    def _dispatch_linkage_plan(self, params):
+        r = self.core.create_plan(
+            params['acct'], params['occasion'], params['event_date'],
+            params['budget'], params['steps'], person=params.get('person'))
+        plan = self.core.get_plan(r['plan_id'])
+
+        # 用户在同句里说了"锁定" → 一步到位，但锁定仍是**独立的黄色动作**：
+        # 这里不偷偷锁，而是把计划返回给上层，由上层再走一次确认。
+        # 理由：锁定会让资金不可动用，属于需要用户明确确认的副作用，
+        # 不能因为"他在一句话里提过"就替他决定。
+        r['plan'] = plan
+        r['auto_lock'] = bool(params.get('auto_lock'))
+        r['event_date_is_default'] = bool(params.get('event_date_is_default'))
+        r['available'] = self.core.available(params['acct'])
+        return r
+
+    # ── 联动计划：执行所有到期步骤 ──────────────────────────────────────
+    def _dispatch_linkage_run(self, plan_id, params):
+        """把计划里**今天到期**的步骤依次执行。
+
+        注意这里按步骤逐个走 execute_step（各自带幂等键），
+        因此任何一步失败都不会影响已成功的步骤 —— 时序任务不该"全有或全无"：
+        鲜花订好了但蛋糕没订，应该保留鲜花那一步，而不是整体回滚。
+        """
+        today = params.get('today') or self._now_date()
+        plan = self.core.get_plan(plan_id)
+        if plan['locked'] <= 0:
+            raise BankError('NOT_LOCKED',
+                            '该计划还没有锁定资金，不能执行扣款步骤。'
+                            '请先确认锁定 %s 元。'
+                            % cents_to_yuan(plan['budget']))
+
+        due = [s for s in plan['steps']
+               if s['status'] == 'pending' and s['due_date'] <= today]
+        if not due:
+            pending = [s for s in plan['steps'] if s['status'] == 'pending']
+            if not pending:
+                return {'plan_id': plan_id, 'executed': [],
+                        'message': '该计划的步骤都已执行完毕。'}
+            nxt = min(s['due_date'] for s in pending)
+            raise BankError('NOT_DUE',
+                            '该计划还没有到期的步骤。最近一步应在 %s 执行，今天是 %s。'
+                            '提前执行会打乱时序，已拒绝。' % (nxt, today))
+
+        executed = []
+        for st in due:
+            ik = 'LK%s%s' % (plan_id[-6:], st['id'][-6:])
+            out = self.core.execute_step(plan_id, st['id'], ik, today=today)
+            executed.append(out)
+        after = self.core.get_plan(plan_id)
+        a = self.core.get_account(plan['acct'])
+        return {'plan_id': plan_id, 'executed': executed, 'plan': after,
+                'balance': a['balance'], 'locked': a['locked_amount'],
+                'available': self.core.available(plan['acct'])}
 
     # ── 账单分析 ──────────────────────────────────────────────────────
     def _analyze_bill(self, acct, period):
@@ -649,6 +890,52 @@ class AgentSession:
         return {'anomalies': out, 'median': mid, 'count': len(rows)}
 
     # ── 结果包装 ──────────────────────────────────────────────────────
+    def _issue_lock_card(self, acct):
+        """为"刚登记的计划"签发一张锁定确认卡（黄色）。
+
+        复用与 propose 相同的流程：算分级 → 建 PendingOperation → 签发凭证。
+        这样锁定走的是**同一条受约束的路径**，而不是一条快捷通道。
+        """
+        plans = [p for p in self.core.list_plans(acct)
+                 if p['status'] == 'planned' and p['locked'] == 0]
+        if not plans:
+            return None
+        plan = plans[-1]
+        params = {'acct': acct, 'plan_id': plan['id'], 'amount': plan['budget']}
+        action = 'linkage.lock'
+        tier_info = check_tier(action, params, self.core, acct)
+        self.audit.append('tier.checked', session_id=self.id, phase='propose',
+                          action=action, tier=tier_info['tier'],
+                          reasons=tier_info['reasons'],
+                          params=self._safe_params(params))
+        idem_key = 'IK' + uuid.uuid4().hex[:16].upper()
+        op = PendingOperation(action, params, tier_info, idem_key,
+                              self._summarize(action, params))
+        self.pending[op.id] = op
+        token = self.confirm.issue(self.id, action, params)
+        self.audit.append('confirm.issued', session_id=self.id, op=op.id,
+                          tier=tier_info['tier'], token_prefix=token[:8],
+                          note='chained_from=linkage.plan')
+        card = {
+            'type': 'confirm_required',
+            'op_id': op.id,
+            'tier': tier_info['tier'],
+            'tier_label': TIER_LABEL[tier_info['tier']],
+            'action': action,
+            'summary': op.summary,
+            'reasons': tier_info['reasons'],
+            'needs': tier_info['needs'],
+            'confirm_token': token,
+            'expires_in': self.confirm.ttl,
+            'details': self._details(action, params),
+            'intent': {'intent': 'linkage_lock', 'slots': {'acct': acct,
+                                                            'plan_id': plan['id']},
+                       'confidence': 0.87, 'raw': ''},
+        }
+        if tier_info['tier'] == RED:
+            card['requires_strong'] = True
+        return card
+
     def _wrap_readonly_result(self, intent, result, tier_info):
         return {'type': 'result', 'intent': intent.name, 'tier': tier_info['tier'],
                 'tier_label': TIER_LABEL[tier_info['tier']],
@@ -700,7 +987,59 @@ class AgentSession:
                              % (p['name'], p['term'], p['annualized'] * 100,
                                 cents_to_yuan(p['min_amount']), p['risk']))
             return '\n'.join(lines)
+        if name == 'linkage_list':
+            plans = r['plans']
+            if not plans:
+                return ('你还没有登记跨场景联动计划。\n'
+                        '可以这样说：「我爱人生日，帮我当月锁定 1000 元」')
+            lines = ['你共有 **%d 个**联动计划（可用余额 %s 元）：'
+                     % (len(plans), cents_to_yuan(r['available']))]
+            for p in plans:
+                stat = {'planned': '已登记（未锁资金）', 'locked': '已锁定资金',
+                        'done': '已完成', 'cancelled': '已取消'}.get(p['status'], p['status'])
+                lines.append('· **%s**（%s）预算 %s 元 · 状态：%s'
+                             % (p['occasion'], p['event_date'],
+                                cents_to_yuan(p['budget']), stat))
+                for st in p['steps']:
+                    mark = '✓' if st['status'] == 'done' else '·'
+                    lines.append('    %s %s（%s，%s 元）'
+                                 % (mark, st['detail'], st['due_date'],
+                                    cents_to_yuan(st['amount'])))
+            return '\n'.join(lines)
+        # ⚠ 这里的分支按 **intent.name**（下划线风格）判断，不是 action 名。
+        # 与 _build_params 恰好相反（那里按 action 判断）。
+        # 踩过的坑：我在这里写了 'linkage_plan'（action 名），
+        # 而传进来的是 'linkage_create'，于是计划登记后只回一句"已完成"，
+        # 用户看不到计划内容、步骤、到期日。名字里带点和不带点必须分清。
+        if name == 'linkage_plan' or name == 'linkage_create':
+            return self._linkage_plan_text(r)
         return '已完成。'
+
+    def _linkage_plan_text(self, r):
+        plan = r['plan']
+        lines = ['已登记联动计划 **%s**（%s）。' % (plan['occasion'], plan['event_date'])]
+        if plan.get('person'):
+            lines.append('关联人：%s' % plan['person'])
+        lines.append('预算 %s 元，拆成 %d 个步骤：'
+                     % (cents_to_yuan(plan['budget']), len(plan['steps'])))
+        for st in plan['steps']:
+            lines.append('· %s —— %s 执行，%s 元'
+                         % (st['detail'], st['due_date'], cents_to_yuan(st['amount'])))
+        tot = sum(st['amount'] for st in plan['steps'])
+        if tot > plan['budget']:
+            lines.append('\n⚠ 步骤合计 %s 元超过预算 %s 元，请调整预算或步骤。'
+                         % (cents_to_yuan(tot), cents_to_yuan(plan['budget'])))
+        lines.append('\n计划已登记但**尚未锁定资金** —— 钱还能正常使用。')
+        if r.get('auto_lock'):
+            lines.append('你提到要锁定资金，请确认下面这张卡来预留 %s 元。'
+                         % cents_to_yuan(plan['budget']))
+        # 默认日期必须如实说明，不能假装用户告诉过我们。
+        # 真实产品必须让用户确认日期 —— 记错生日会真的错过。
+        if r.get('event_date_is_default'):
+            lines.append('（说明：本次使用的是演示默认事件日期 %s。'
+                         '真实使用请明确告知日期，例如「生日是 2026-06-18」。）'
+                         % plan['event_date'])
+        return '\n'.join(lines)
 
     def _wrap_exec_result(self, op, result):
         action = op.action
@@ -748,6 +1087,49 @@ class AgentSession:
                       cents_to_yuan(result.get('profit_settled', 0)),
                       result['order_id'], cents_to_yuan(result.get('balance_after', 0))))
             return {'type': 'result', 'data': result, 'message': msg}
+
+        # ── 跨场景联动 ────────────────────────────────────────────────
+        if action == 'linkage.plan':
+            return {'type': 'result', 'data': result,
+                    'message': self._linkage_plan_text(result)}
+
+        if action == 'linkage.lock':
+            plan = result.get('plan') or {}
+            replay = result.get('idempotent_replay')
+            msg = ('已为「%s」锁定 **%s 元**。余额仍是 %s 元，'
+                   '其中 %s 元现在不能动用（可动用 %s 元）。'
+                   % (plan.get('occasion', '计划'), cents_to_yuan(result['locked']),
+                      cents_to_yuan(result.get('balance', 0)),
+                      cents_to_yuan(result['locked']),
+                      cents_to_yuan(result.get('available', 0))))
+            if replay:
+                msg += '\n\n（这笔锁定已存在，按幂等处理，**没有重复锁定**。）'
+            return {'type': 'result', 'tier': op.tier_info['tier'],
+                    'tier_label': TIER_LABEL[op.tier_info['tier']],
+                    'data': result, 'message': msg}
+
+        if action == 'linkage.run':
+            ex = result.get('executed') or []
+            if not ex:
+                return {'type': 'result', 'data': result,
+                        'message': result.get('message', '没有需要执行的步骤。')}
+            lines = ['已执行 %d 个到期步骤：' % len(ex)]
+            for e in ex:
+                lines.append('· %s —— %s 元%s'
+                             % (e.get('detail', e.get('kind', '')),
+                                cents_to_yuan(e.get('amount', 0)),
+                                '（幂等重放）' if e.get('idempotent_replay') else ''))
+            lines.append('\n账户余额 %s 元，其中已锁定 %s 元，可动用 %s 元。'
+                         % (cents_to_yuan(result.get('balance', 0)),
+                            cents_to_yuan(result.get('locked', 0)),
+                            cents_to_yuan(result.get('available', 0))))
+            # 模拟边界必须明说，不能让人以为真的下单了
+            lines.append('\n⚠ **外部订购为模拟**：本项目没有真实的鲜花/蛋糕供应商接口，'
+                         '这里只演示"资金到位 + 时序触发"这条链路。')
+            return {'type': 'result', 'tier': op.tier_info['tier'],
+                    'tier_label': TIER_LABEL[op.tier_info['tier']],
+                    'data': result, 'message': '\n'.join(lines)}
+
         return {'type': 'result', 'data': result, 'message': '操作已完成。'}
 
     def _summarize(self, action, params):
@@ -769,6 +1151,10 @@ class AgentSession:
                                         % (p.get('product') or '理财产品',
                                            cents_to_yuan(p.get('amount', 0))),
             'split.request': lambda p: '发起 AA 收款，%d 人平摊' % p.get('people', 0),
+            'linkage.plan': lambda p: '登记联动计划「%s」' % p.get('occasion', ''),
+            'linkage.lock': lambda p: '为联动计划锁定 %s 元'
+                                      % cents_to_yuan(p.get('budget') or p.get('amount') or 0),
+            'linkage.run': lambda p: '执行联动计划的到期步骤',
         }
         fn = labels.get(action)
         return fn(params) if fn else action
@@ -804,6 +1190,42 @@ class AgentSession:
             d.append(('账户', params.get('acct')))
             d.append(('产品', params.get('product') or '—'))
             d.append(('赎回金额', '%s 元' % cents_to_yuan(params.get('amount') or 0)))
+        elif action == 'linkage.plan':
+            d.append(('账户', params.get('acct')))
+            d.append(('事件', params.get('occasion') or '—'))
+            if params.get('person'):
+                d.append(('关联人', params['person']))
+            d.append(('事件日期', params.get('event_date') or '—'))
+            d.append(('预算', '%s 元' % cents_to_yuan(params.get('budget') or 0)))
+            d.append(('步骤数', str(len(params.get('steps') or []))))
+        elif action == 'linkage.lock':
+            plan = None
+            pid = params.get('plan_id')
+            if pid:
+                try:
+                    plan = self.core.get_plan(pid)
+                except BankError:
+                    plan = None
+            d.append(('账户', params.get('acct')))
+            d.append(('计划', (plan or {}).get('occasion', params.get('plan_id') or '—')))
+            d.append(('锁定金额', '%s 元' % cents_to_yuan(
+                (plan or {}).get('budget') or params.get('amount') or 0)))
+            d.append(('影响', '这笔钱仍在你账户里，但期间不能用于转账/理财'))
+        elif action == 'linkage.run':
+            pid = params.get('plan_id')
+            plan = None
+            if pid:
+                try:
+                    plan = self.core.get_plan(pid)
+                except BankError:
+                    plan = None
+            d.append(('账户', params.get('acct')))
+            d.append(('计划', (plan or {}).get('occasion', params.get('plan_id') or '—')))
+            due = [s for s in (plan or {}).get('steps', [])
+                   if s['status'] == 'pending' and s['due_date'] <= (params.get('today') or '')]
+            d.append(('本次到期步骤', '、'.join(s['detail'] for s in due) or '—'))
+            d.append(('本次扣款', '%s 元' % cents_to_yuan(sum(s['amount'] for s in due))))
+            d.append(('外部订购', '模拟（无真实供应商接口）'))
         return [{'label': a, 'value': b} for a, b in d]
 
     def _safe_params(self, params):

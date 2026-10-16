@@ -298,7 +298,16 @@
       if (r.type === 'result') {
         bubbleAI(r.message);
         pushStep('exec', '绿色级别 · 自动执行',
-          '纯查询操作，无副作用，无需二次确认', 'ok');
+          '本步骤无副作用，无需二次确认', 'ok');
+        // 链接卡：某个自动执行的动作会引出下一步需要确认的操作
+        // （跨场景联动里"登记计划"是绿色，但它链接一张黄色的"锁定资金"卡）。
+        // 不渲染它，用户就永远走不到锁定那一步。
+        if (r.chained) {
+          pushStep('tier', '下一步：' + esc(r.chained.tier_label),
+            (r.chained.reasons || []).map(esc).join('<br>'),
+            r.chained.tier === 'red' ? 'bad' : 'warn');
+          renderTierCard(r.chained);
+        }
       } else if (r.type === 'confirm_required') {
         pushStep('tier', '分级判定：' + esc(r.tier_label),
           (r.reasons || []).map(esc).join('<br>'), r.tier === 'red' ? 'bad' : 'warn');

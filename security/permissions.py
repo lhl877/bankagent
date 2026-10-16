@@ -64,6 +64,28 @@ ACTIONS = {
     'wealth.holdings':      {'tier': GREEN, 'desc': '查询持仓与收益', 'sensitive': False},
     'subscription.list':    {'tier': GREEN, 'desc': '查询订阅与代扣', 'sensitive': False},
 
+    # ── 跨场景联动（赛题场景 6）───────────────────────────────────────
+    # 分级理由（这一组是刻意拆成三级的，因为它横跨三种风险）：
+    #
+    #   linkage.plan  绿色 —— 只是**记一条意图**，不动钱、不改变任何资金可用性。
+    #                 撤销它就是删一条记录。这类"无副作用"的操作按绿色自动执行，
+    #                 否则用户每登记一个提醒都要确认，体验会很差。
+    #
+    #   linkage.lock  黄色 —— 钱还在账上，但**这些钱不能花了**。
+    #                 它可逆（release_lock 立刻恢复），但确实限制了用户的
+    #                 资金自由，所以必须让用户看清"锁多少、锁到什么时候"再确认。
+    #                 为什么不判红级：没有资金离账，不涉及不可逆的资金安全事件，
+    #                 判红级会让强验证被滥用，反而稀释了红级的严肃性。
+    #
+    #   linkage.run   红色 —— 真正扣款下单，钱离账且**不可逆**（礼品已订）。
+    #                 与"大额转账""申购理财"同级：必须强验证。
+    #                 多一道保险是计划必须已经锁定资金（见 core.execute_step），
+    #                 避免动用未预留的余额。
+    'linkage.plan':         {'tier': GREEN, 'desc': '登记跨场景联动计划', 'sensitive': False},
+    'linkage.list':         {'tier': GREEN, 'desc': '查询跨场景联动计划', 'sensitive': False},
+    'linkage.lock':         {'tier': YELLOW, 'desc': '为联动计划锁定资金', 'sensitive': True},
+    'linkage.run':          {'tier': RED, 'desc': '执行联动步骤（扣款下单）', 'sensitive': True},
+
     # ── 黄色：有副作用但可逆、金额小 ────────────────────────────────
     'transfer.small':       {'tier': YELLOW, 'desc': '小额转账',      'sensitive': True},
     'transfer.scheduled':   {'tier': YELLOW, 'desc': '定时转账',      'sensitive': True},
