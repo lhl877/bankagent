@@ -24,6 +24,13 @@
   /* ── 演示状态：放 sessionStorage，刷新后保持，点重置可恢复 ────────── */
   var DEFAULT = {
     balances: { A001: 500000, A002: 120000, A003: 80000, A004: 1500000, A005: 30000 },
+    // 持仓金额直接写死，不用「起购额 × N」推导 ——
+    // 推导时货币基金起购只要 1 元，×5 仍是 5 元，
+    // 而演示会说「赎回 1000 元」，会撞上"超过持仓"。种子数据要面向演示动作设计。
+    holdings: {
+      '稳健增利 90 天': 500000,
+      '货币基金 A': 320000
+    },
     dailyOut: 0,
     cardStatus: 'active',
     seq: 0,
@@ -117,6 +124,14 @@
   }
 
   var PEOPLE = { '李娜': 'A002', '王强': 'A003', '刘敏': 'A004', '张伟': 'A001' };
+
+  // 与 bank/core.py 的 WEALTH_CATALOG 保持一致（含起购金额，用于申购校验）
+  var WEALTH_CATALOG = [
+    { name: '货币基金 A', term: '随时可取', annualized: 0.0185, min_amount: 100, risk: '低' },
+    { name: '稳健增利 90 天', term: '90 天', annualized: 0.031, min_amount: 100000, risk: '中低' },
+    { name: '固收增强 180 天', term: '180 天', annualized: 0.0385, min_amount: 500000, risk: '中' },
+    { name: '指数增强组合', term: '365 天', annualized: 0.062, min_amount: 1000000, risk: '中高' }
+  ];
 
   function payee(text) {
     var m = text.match(/\b(1[3-9]\d{9})\b/);
@@ -255,7 +270,88 @@
         intent: { intent: 'subscription_list', confidence: 0.92, slots: { acct: 'A001' } } };
     }
 
-    if (/理财|基金|收益|年化|持仓/.test(text)) {
+    // 4. 理财申购 / 赎回
+    var product = null;
+    for (var wi = 0; wi < WEALTH_CATALOG.length; wi++) {
+      if (text.indexOf(WEALTH_CATALOG[wi].name) >= 0) { product = WEALTH_CATALOG[wi].name; break; }
+    }
+    if (!product) {
+      var wkeys = { '货币基金 A': ['货币'], '稳健增利 90 天': ['稳健', '增利'],
+                    '固收增强 180 天': ['固收', '增强'], '指数增强组合': ['指数', '组合'] };
+      for (var wn in wkeys) {
+        if (wkeys[wn].some(function (k) { return text.indexOf(k) >= 0; })) { product = wn; break; }
+      }
+    }
+    // 列举类问法不能进操作分支。「我有哪些理财」含「理财」二字，
+    // 若不排除就会被当成申购、然后因缺金额被追问，与用户意图相反。
+    var isListing = /有哪些|有什么|看看|列表|持有哪些|哪个好/.test(text)
+                    && !/买|申购|购买|赎回|取出|卖掉/.test(text);
+    var hasOp = /买|申购|购买|赎回|取出|卖掉/.test(text);
+    if ((hasOp || (product && !isListing)) && !isListing) {
+      var wamt = amount(text);
+      if (/赎回|取出|卖掉/.test(text)) {
+        // 未指名产品时，只在持仓唯一的情况下补全；多个持仓不猜
+        if (!product) {
+          var held = Object.keys(ST.holdings).filter(function (k) { return ST.holdings[k] > 0; });
+          if (held.length === 1) product = held[0];
+        }
+        if (!product) {
+          logEvent('intent.need_slots', { intent: 'wealth_redeem', missing: ['product'] });
+          return { type: 'clarify', message: '你想赎回哪一个理财产品？你当前持有：' +
+            Object.keys(ST.holdings).filter(function (k) { return ST.holdings[k] > 0; }).join('、'),
+            intent: { intent: 'wealth_redeem', confidence: 0.7, slots: {} } };
+        }
+        if (wamt === null) {
+          return { type: 'clarify', message: '请问赎回多少元？',
+            intent: { intent: 'wealth_redeem', confidence: 0.7, slots: { product: product } } };
+        }
+        var rcents = Math.round(wamt * 100);
+        var have = ST.holdings[product] || 0;
+        logEvent('tier.checked', { action: 'wealth.redeem', tier: 'red' });
+        ST.seq++;
+        return { type: 'confirm_required', tier: 'red', tier_label: fmtTier('red'),
+          op_id: 'OP' + ST.seq + 'WRE', action: 'wealth.redeem',
+          summary: '赎回「' + product + '」' + YUAN(rcents) + ' 元',
+          reasons: ['赎回理财产品 的基准级别：红色 · 需强验证',
+                    '涉及资金安全，需多因子认证'],
+          needs: ['user_confirmation', 'strong_verification'],
+          confirm_token: 'STATIC-WRE', expires_in: 180,
+          details: [{ label: '账户', value: 'A001' }, { label: '产品', value: product },
+                    { label: '赎回金额', value: YUAN(rcents) + ' 元' },
+                    { label: '当前持仓', value: YUAN(have) + ' 元' }],
+          _amount: rcents, _product: product, _side: 'redeem',
+          intent: { intent: 'wealth_redeem', confidence: 0.85,
+                    slots: { acct: 'A001', product: product, amount_yuan: wamt } } };
+      }
+      // 申购
+      if (!product) product = '货币基金 A';
+      if (wamt === null) {
+        return { type: 'clarify', message: '请问申购多少元？',
+          intent: { intent: 'wealth_purchase', confidence: 0.7, slots: { product: product } } };
+      }
+      var pcents = Math.round(wamt * 100);
+      logEvent('tier.checked', { action: 'wealth.purchase', tier: 'red' });
+      ST.seq++;
+      return { type: 'confirm_required', tier: 'red', tier_label: fmtTier('red'),
+        op_id: 'OP' + ST.seq + 'WBU', action: 'wealth.purchase',
+        summary: '申购「' + product + '」' + YUAN(pcents) + ' 元',
+        reasons: ['申购理财产品 的基准级别：红色 · 需强验证',
+                  '涉及资金安全，需多因子认证'],
+        needs: ['user_confirmation', 'strong_verification'],
+        confirm_token: 'STATIC-WBU', expires_in: 180,
+        details: [{ label: '账户', value: 'A001' }, { label: '产品', value: product },
+                  { label: '金额', value: YUAN(pcents) + ' 元' },
+                  { label: '活期余额', value: YUAN(ST.balances.A001) + ' 元' }],
+        _amount: pcents, _product: product, _side: 'purchase',
+        intent: { intent: 'wealth_purchase', confidence: 0.85,
+                  slots: { acct: 'A001', product: product, amount_yuan: wamt } } };
+    }
+
+    // 只有纯查询才走这里。带操作动词的（赎回/申购/买入）已在上面被
+    // 理财操作分支处理掉了 —— 不收窄的话「赎回 1000 元货币基金 A」
+    // 会因为含"基金"二字被这里截获，返回产品列表而不是赎回确认卡。
+    if (/理财|基金|收益|年化|持仓/.test(text)
+        && !/赎回|取出|卖掉|申购|买入|购买/.test(text)) {
       logEvent('tier.checked', { action: 'wealth.list', tier: 'green' });
       return { type: 'result', tier: 'green', tier_label: fmtTier('green'),
         auto_executed: true,
@@ -264,7 +360,7 @@
         intent: { intent: 'wealth_list', confidence: 0.9, slots: { acct: 'A001' } } };
     }
 
-    // 4. 改额度
+    // 5. 改额度
     if (/额度|限额|提额/.test(text)) {
       var lim = amount(text);
       var limDetail = lim === null
@@ -371,6 +467,62 @@
                  '这一条在完整版里会写入 account.daily_limit。）' };
     }
 
+    // 理财申赎
+    if (body._side === 'purchase' || body._side === 'redeem') {
+      var wp = body._product, wa = body._amount || 0;
+      logEvent('confirm.checked', { op: opId, phase: 'execute', tier: 'red' });
+      if (!code) {
+        return { type: 'need_strong_verification',
+          message: '这是红色级别操作，需要短信验证码确认。', op_id: opId,
+          hint: '确认凭证仍然有效，获取验证码后继续即可，不需要重新发起。' };
+      }
+      if (code !== ISSUED_CODE) {
+        logEvent('verify.rejected', { op: opId, reason: '验证码不正确' });
+        return { type: 'refused', message: '验证码不正确', op_id: opId, retryable: true };
+      }
+      logEvent('verify.passed', { op: opId, method: 'sms_otp' });
+      logEvent('confirm.consumed', { op: opId });
+
+      var spec = null;
+      for (var si = 0; si < WEALTH_CATALOG.length; si++) {
+        if (WEALTH_CATALOG[si].name === wp) { spec = WEALTH_CATALOG[si]; break; }
+      }
+      var oid = 'WO' + sha256Sync(opId + Date.now()).slice(0, 12).toUpperCase();
+      if (body._side === 'purchase') {
+        if (wa < spec.min_amount) {
+          return { type: 'exec_failed', code: 'BELOW_MIN_AMOUNT',
+            message: '低于起购金额：' + YUAN(spec.min_amount) + ' 起购，本次 ' + YUAN(wa) };
+        }
+        if (ST.balances.A001 < wa) {
+          return { type: 'exec_failed', code: 'INSUFFICIENT_FUNDS',
+            message: '活期余额不足：可用 ' + YUAN(ST.balances.A001) + ' 元，需要 ' + YUAN(wa) + ' 元' };
+        }
+        ST.balances.A001 -= wa;
+        ST.holdings[wp] = (ST.holdings[wp] || 0) + wa;
+        save(ST);
+        logEvent('exec.succeeded', { op: opId, action: 'wealth.purchase', amount: wa });
+        return { type: 'result', tier: 'red', tier_label: fmtTier('red'),
+          message: '已申购「' + wp + '」**' + YUAN(wa) + ' 元**。订单号 `' + oid +
+                   '`，活期余额 ' + YUAN(ST.balances.A001) + ' 元。' };
+      }
+      var hold = ST.holdings[wp] || 0;
+      if (!hold) {
+        return { type: 'exec_failed', code: 'NOT_HELD', message: '你没有持有「' + wp + '」' };
+      }
+      if (wa > hold) {
+        return { type: 'exec_failed', code: 'EXCEEDS_HOLDING',
+          message: '赎回额超过持仓：持有 ' + YUAN(hold) + ' 元，本次请求 ' + YUAN(wa) + ' 元' };
+      }
+      ST.holdings[wp] = hold - wa;
+      if (ST.holdings[wp] <= 0) delete ST.holdings[wp];
+      ST.balances.A001 += wa;
+      save(ST);
+      logEvent('exec.succeeded', { op: opId, action: 'wealth.redeem', amount: wa });
+      return { type: 'result', tier: 'red', tier_label: fmtTier('red'),
+        message: '已赎回「' + wp + '」**' + YUAN(wa) + ' 元**。订单号 `' + oid +
+                 '`，活期余额 ' + YUAN(ST.balances.A001) + ' 元。' };
+    }
+
     // 转账
     var cents = body._amount || 0;
     // 关键：用**已判定的级别**决定是否需要强验证，而不是用金额重新推断。
@@ -461,6 +613,8 @@
       // 把"当初判定的级别"带过去。执行时必须按它校验，
       // 不能用金额重新推断 —— 那会漏掉"日累计触发红级"这条路径。
       body._wasRed = window.__lastOp.tier === 'red';
+      body._product = window.__lastOp._product;
+      body._side = window.__lastOp._side;
       body.to_acct = (window.__lastOp._payee || {}).acct;
       body.to_name = (window.__lastOp._payee || {}).name;
     }

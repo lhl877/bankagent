@@ -53,6 +53,21 @@ def cents_to_yuan(cents):
     return '%.2f' % (cents / 100.0)
 
 
+# 演示用理财产品目录。
+# 放在 core 层而不是 orchestrator 层，因为申购/赎回要在这里校验起购金额与产品存在性 ——
+# 校验依据必须位于执行入口这一侧，否则上层可以绕过校验直接调 purchase()。
+WEALTH_CATALOG = [
+    {'name': '货币基金 A', 'term': '随时可取', 'annualized': 0.0185,
+     'min_amount': 100, 'risk': '低'},
+    {'name': '稳健增利 90 天', 'term': '90 天', 'annualized': 0.0310,
+     'min_amount': 100000, 'risk': '中低'},
+    {'name': '固收增强 180 天', 'term': '180 天', 'annualized': 0.0385,
+     'min_amount': 500000, 'risk': '中'},
+    {'name': '指数增强组合', 'term': '365 天', 'annualized': 0.0620,
+     'min_amount': 1000000, 'risk': '中高'},
+]
+
+
 class BankError(Exception):
     """业务型错误。带 code，方便上层区分处理，不要把 traceback 暴露给用户。"""
 
@@ -136,8 +151,11 @@ class Core:
         -- 双重记账：每笔资金变动成对出现，可核对
         CREATE TABLE IF NOT EXISTS ledger (
           id          INTEGER PRIMARY KEY AUTOINCREMENT,
-          transfer_id TEXT NOT NULL REFERENCES transfer(id),
+          -- transfer_id 允许为空：理财申赎也会变动资金，但它不是转账。
+          -- 若强制 NOT NULL，就只能伪造一条 transfer 记录来挂账，那是自欺。
+          transfer_id TEXT REFERENCES transfer(id),
           acct        TEXT NOT NULL REFERENCES account(id),
+          owner_acct  TEXT,                          -- 该笔归属哪个账户（含理财）
           direction   TEXT NOT NULL,                -- debit | credit
           amount      INTEGER NOT NULL,             -- 恒为正数，方向看 direction
           balance_after INTEGER NOT NULL,
@@ -168,6 +186,33 @@ class Core:
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
           val TEXT NOT NULL
+        );
+
+        -- 理财持仓。做成一等实体而不是硬编码，否则"赎回"没法真正改变状态，
+        -- 也无法校验"赎回金额不得超过持仓"。
+        CREATE TABLE IF NOT EXISTS holding (
+          id         TEXT PRIMARY KEY,
+          acct       TEXT NOT NULL REFERENCES account(id),
+          product    TEXT NOT NULL,
+          term       TEXT NOT NULL,           -- 期限描述，如「90 天」
+          amount     INTEGER NOT NULL,        -- 持有金额（分）
+          annualized REAL NOT NULL,           -- 年化收益率
+          profit     INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_holding_acct ON holding(acct);
+
+        -- 理财申赎流水（幂等键在此唯一）
+        CREATE TABLE IF NOT EXISTS wealth_order (
+          id         TEXT PRIMARY KEY,
+          idem_key   TEXT NOT NULL,
+          acct       TEXT NOT NULL REFERENCES account(id),
+          product    TEXT NOT NULL,
+          side       TEXT NOT NULL,           -- purchase | redeem
+          amount     INTEGER NOT NULL,
+          status     TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE (idem_key)
         );
         ''')
         row = c.execute("SELECT val FROM meta WHERE key='schema_version'").fetchone()
@@ -298,10 +343,14 @@ class Core:
                       (tid, idem_key, from_acct, to_acct, amount, note, 'succeeded', now))
             c.execute('UPDATE account SET balance=? WHERE id=?', (new_src, from_acct))
             c.execute('UPDATE account SET balance=? WHERE id=?', (new_dst, to_acct))
-            c.execute('INSERT INTO ledger(transfer_id,acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?)', (tid, from_acct, 'debit', amount, new_src, now))
-            c.execute('INSERT INTO ledger(transfer_id,acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?)', (tid, to_acct, 'credit', amount, new_dst, now))
+            # owner_acct 标明这笔归属哪个账户：付款方记 from，收款方记 to。
+            # reconcile() 只按它汇总，一笔只算一次。
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
+                      'VALUES(?,?,?,?,?,?,?)',
+                      (tid, from_acct, from_acct, 'debit', amount, new_src, now))
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
+                      'VALUES(?,?,?,?,?,?,?)',
+                      (tid, to_acct, to_acct, 'credit', amount, new_dst, now))
 
             c.execute('COMMIT')
             return {
@@ -365,10 +414,12 @@ class Core:
             c.execute('UPDATE account SET balance=? WHERE id=?', (bd - amt, d))
             c.execute('UPDATE transfer SET status=?, reversed_at=? WHERE id=?',
                       ('reversed', now, transfer_id))
-            c.execute('INSERT INTO ledger(transfer_id,acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?)', (transfer_id, f, 'credit', amt, bf + amt, now))
-            c.execute('INSERT INTO ledger(transfer_id,acct,direction,amount,balance_after,created_at) '
-                      'VALUES(?,?,?,?,?,?)', (transfer_id, d, 'debit', amt, bd - amt, now))
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
+                      'VALUES(?,?,?,?,?,?,?)',
+                      (transfer_id, f, f, 'credit', amt, bf + amt, now))
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,amount,balance_after,created_at) '
+                      'VALUES(?,?,?,?,?,?,?)',
+                      (transfer_id, d, d, 'debit', amt, bd - amt, now))
             c.execute('COMMIT')
             return {'transfer_id': transfer_id, 'status': 'reversed',
                     'idempotent_replay': False, 'reason': reason}
@@ -389,7 +440,8 @@ class Core:
         for a in self.list_accounts():
             led = self.conn.execute('''
                 SELECT COALESCE(SUM(CASE direction WHEN 'credit' THEN amount ELSE -amount END),0) AS s
-                FROM ledger WHERE acct=?''', (a['id'],)).fetchone()['s']
+                FROM ledger WHERE owner_acct=?''',
+                (a['id'],)).fetchone()['s']
             opening = self.conn.execute(
                 "SELECT val FROM meta WHERE key=?", ('opening:%s' % a['id'],)).fetchone()
             base = int(opening['val']) if opening else 0
@@ -401,6 +453,167 @@ class Core:
                     'diff': a['balance'] - (base + led),
                 })
         return {'ok': not problems, 'problems': problems}
+
+    def overview(self):
+        """演示首页要的聚合视图（账户 / 持仓 / 订阅）。"""
+        return {
+            'accounts': [dict(r) for r in self.conn.execute(
+                'SELECT * FROM account ORDER BY id')],
+            'holdings': self.holdings(None),
+            'subscriptions': [dict(r) for r in self.conn.execute(
+                'SELECT * FROM subscription WHERE status="active" '
+                'ORDER BY next_charge')],
+        }
+
+    # ── 理财持仓与申赎 ─────────────────────────────────────────────────
+    def holdings(self, acct_id=None):
+        if acct_id:
+            rows = self.conn.execute(
+                'SELECT * FROM holding WHERE acct=? ORDER BY amount DESC',
+                (acct_id,)).fetchall()
+        else:
+            rows = self.conn.execute(
+                'SELECT * FROM holding ORDER BY acct, amount DESC').fetchall()
+        return [dict(r) for r in rows]
+
+    def purchase(self, acct_id, product, amount, idem_key):
+        """申购理财产品。从活期余额扣款，转为持仓。
+
+        与 transfer() 同样是**幂等**的：同一个 idem_key 重复提交只会成功一次。
+        理财申购在真实银行里也要求幂等 —— 网络重试导致重复申购同样会造成损失。
+        """
+        if not isinstance(amount, int) or amount <= 0:
+            raise BankError('INVALID_AMOUNT', '申购金额必须是正整数（单位分）')
+        if not idem_key:
+            raise BankError('MISSING_IDEM_KEY', '缺少幂等键')
+        spec = next((p for p in WEALTH_CATALOG if p['name'] == product), None)
+        if not spec:
+            raise BankError('PRODUCT_NOT_FOUND', '没有这个理财产品：%s' % product)
+        if amount < spec['min_amount']:
+            raise BankError('BELOW_MIN_AMOUNT',
+                            '低于起购金额：%s 起购，本次 %s'
+                            % (cents_to_yuan(spec['min_amount']), cents_to_yuan(amount)))
+
+        c = self.conn
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            prev = c.execute('SELECT * FROM wealth_order WHERE idem_key=?',
+                             (idem_key,)).fetchone()
+            if prev:
+                c.execute('COMMIT')
+                return {'order_id': prev['id'], 'status': prev['status'],
+                        'idempotent_replay': True, 'amount': prev['amount']}
+
+            a = c.execute('SELECT * FROM account WHERE id=?', (acct_id,)).fetchone()
+            if not a:
+                raise BankError('ACCOUNT_NOT_FOUND', '账户不存在')
+            if a['balance'] < amount:
+                raise BankError('INSUFFICIENT_FUNDS',
+                                '活期余额不足：可用 %s 元，需要 %s 元'
+                                % (cents_to_yuan(a['balance']), cents_to_yuan(amount)))
+
+            now = int(time.time() * 1000)
+            oid = 'WO' + uuid.uuid4().hex[:12].upper()
+            c.execute('UPDATE account SET balance=? WHERE id=?',
+                      (a['balance'] - amount, acct_id))
+
+            # 已有同产品持仓则累加，否则新建
+            h = c.execute('SELECT * FROM holding WHERE acct=? AND product=?',
+                          (acct_id, product)).fetchone()
+            if h:
+                c.execute('UPDATE holding SET amount=amount+? WHERE id=?',
+                          (amount, h['id']))
+            else:
+                c.execute('INSERT INTO holding(id,acct,product,term,amount,'
+                          'annualized,profit,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                          ('H' + uuid.uuid4().hex[:10].upper(), acct_id, product,
+                           spec['term'], amount, spec['annualized'], 0, now))
+            c.execute('INSERT INTO wealth_order(id,idem_key,acct,product,side,'
+                      'amount,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                      (oid, idem_key, acct_id, product, 'purchase', amount,
+                       'succeeded', now))
+            # 资金变动必须留痕，否则 reconcile() 对不上 ——
+            # 申购扣了活期余额却不写 ledger，账就"平不了"（实测差 -500000 分）。
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,'
+                      'amount,balance_after,created_at) VALUES(?,?,?,?,?,?,?)',
+                      (None, acct_id, acct_id, 'debit', amount,
+                       a['balance'] - amount, now))
+            c.execute('COMMIT')
+            return {'order_id': oid, 'status': 'succeeded',
+                    'idempotent_replay': False, 'amount': amount,
+                    'product': product, 'balance_after': a['balance'] - amount}
+        except BankError:
+            c.execute('ROLLBACK')
+            raise
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
+
+    def redeem(self, acct_id, product, amount, idem_key):
+        """赎回理财产品。持仓减少，本金回到活期余额。
+
+        校验比申购更严：**赎回额不得超过该产品持仓**，否则会出现"凭空赎回"。
+        这是我在设计时刻意加的约束 —— 没有它，赎回就是一台印钞机。
+        """
+        if not isinstance(amount, int) or amount <= 0:
+            raise BankError('INVALID_AMOUNT', '赎回金额必须是正整数（单位分）')
+        if not idem_key:
+            raise BankError('MISSING_IDEM_KEY', '缺少幂等键')
+
+        c = self.conn
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            prev = c.execute('SELECT * FROM wealth_order WHERE idem_key=?',
+                             (idem_key,)).fetchone()
+            if prev:
+                c.execute('COMMIT')
+                return {'order_id': prev['id'], 'status': prev['status'],
+                        'idempotent_replay': True, 'amount': prev['amount']}
+
+            h = c.execute('SELECT * FROM holding WHERE acct=? AND product=?',
+                          (acct_id, product)).fetchone()
+            if not h:
+                held = c.execute('SELECT DISTINCT product FROM holding WHERE acct=?',
+                                 (acct_id,)).fetchall()
+                raise BankError('NOT_HELD', '你没有持有「%s」。当前持仓：%s'
+                                % (product, '、'.join(x['product'] for x in held) or '无'))
+            if amount > h['amount']:
+                raise BankError('EXCEEDS_HOLDING',
+                                '赎回额超过持仓：持有 %s 元，本次请求 %s 元'
+                                % (cents_to_yuan(h['amount']), cents_to_yuan(amount)))
+
+            now = int(time.time() * 1000)
+            oid = 'WO' + uuid.uuid4().hex[:12].upper()
+            a = c.execute('SELECT * FROM account WHERE id=?', (acct_id,)).fetchone()
+            # 按赎回比例结转收益
+            profit_part = int(h['profit'] * (amount / h['amount'])) if h['amount'] else 0
+            c.execute('UPDATE account SET balance=? WHERE id=?',
+                      (a['balance'] + amount, acct_id))
+            remain = h['amount'] - amount
+            if remain <= 0:
+                c.execute('DELETE FROM holding WHERE id=?', (h['id'],))
+            else:
+                c.execute('UPDATE holding SET amount=?, profit=? WHERE id=?',
+                          (remain, h['profit'] - profit_part, h['id']))
+            c.execute('INSERT INTO wealth_order(id,idem_key,acct,product,side,'
+                      'amount,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                      (oid, idem_key, acct_id, product, 'redeem', amount,
+                       'succeeded', now))
+            c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,'
+                      'amount,balance_after,created_at) VALUES(?,?,?,?,?,?,?)',
+                      (None, acct_id, acct_id, 'credit', amount,
+                       a['balance'] + amount, now))
+            c.execute('COMMIT')
+            return {'order_id': oid, 'status': 'succeeded',
+                    'idempotent_replay': False, 'amount': amount,
+                    'product': product, 'profit_settled': profit_part,
+                    'balance_after': a['balance'] + amount}
+        except BankError:
+            c.execute('ROLLBACK')
+            raise
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
 
     def close(self):
         """关闭所有线程的连接。"""
@@ -430,6 +643,17 @@ SEED_SUBS = [
     ('S004', 'A002', '某外卖会员',   10.00,  'monthly',   7),
 ]
 
+# 期初持仓（演示用）：张伟持「稳健增利 90 天」与「货币基金 A」
+# 期初持仓。金额**直接写死**，不要用「起购额 × N」推导 ——
+# 踩过的坑：推导时货币基金起购只要 1 元，×5 仍是 5 元，
+# 而演示里会说「赎回 1000 元」，直接撞上"超过持仓"，看起来像系统坏了。
+# 种子数据要面向演示动作设计，而不是面向参数关系。
+SEED_HOLDINGS = [
+    # id,     账户,   产品,              持有金额(元)
+    ('H001', 'A001', '稳健增利 90 天',   5000.00),
+    ('H002', 'A001', '货币基金 A',       3200.00),
+]
+
 
 def reset_data(core):
     """清空业务数据并重新写入种子，**不删数据库文件**。
@@ -442,7 +666,8 @@ def reset_data(core):
     c = core.conn
     c.execute('BEGIN IMMEDIATE')
     try:
-        for t in ('ledger', 'transfer', 'subscription', 'card_application', 'account'):
+        for t in ('ledger', 'transfer', 'subscription', 'card_application',
+                  'holding', 'wealth_order', 'account'):
             c.execute('DELETE FROM %s' % t)
         c.execute("DELETE FROM meta WHERE key LIKE 'opening:%'")
         c.execute('COMMIT')
@@ -473,6 +698,20 @@ def _seed(core):
             'next_charge,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
             (sid, acct, merchant, yuan_to_cents(amt_yuan), cycle,
              now + days * day, 'active', now))
+
+    # 期初持仓：让「赎回」在演示一开始就有东西可赎。
+    # 金额取「起购额的 2 倍」，这样既满足起购又不至于把余额占满。
+    # 注意别写成 yuan_to_cents(min_amount / 100 * 2) —— 那样先除 100 再乘 2
+    # 再转回分，等于绕一圈，读的人无法一眼看出到底持有多少。
+    for hid, acct, product, amt_yuan in SEED_HOLDINGS:
+        spec = next((p for p in WEALTH_CATALOG if p['name'] == product), None)
+        if not spec:
+            continue
+        c.execute('INSERT OR REPLACE INTO holding(id,acct,product,term,amount,'
+                  'annualized,profit,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                  (hid, acct, product, spec['term'],
+                   yuan_to_cents(amt_yuan),
+                   spec['annualized'], yuan_to_cents(12.50), now))
 
 
 def init_db(db_path='bank.db', reset=True):

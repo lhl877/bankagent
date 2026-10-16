@@ -30,7 +30,8 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bank.core import BankError, yuan_to_cents, cents_to_yuan
+from bank.core import (BankError, yuan_to_cents, cents_to_yuan,
+                        WEALTH_CATALOG)
 from security.permissions import (
     check_tier, payload_hash, ConfirmationStore, CircuitBreaker,
     GREEN, YELLOW, RED, TIER_LABEL, ACTIONS,
@@ -415,8 +416,16 @@ class AgentSession:
                 miss.append('amount')
             if not s.get('people'):
                 miss.append('people')
-        elif intent.name == 'wealth_purchase' and not s.get('amount_yuan'):
-            miss.append('amount')
+        elif intent.name == 'wealth_purchase':
+            if not s.get('amount_yuan'):
+                miss.append('amount')
+            if not s.get('product'):
+                miss.append('product')
+        elif intent.name == 'wealth_redeem':
+            if not s.get('product'):
+                miss.append('product')
+            if not s.get('amount_yuan'):
+                miss.append('amount')
         elif intent.name == 'subscription_cancel_need_merchant':
             miss.append('merchant')
         return miss
@@ -440,6 +449,11 @@ class AgentSession:
             return '这笔要几个人平摊？'
         if 'merchant' in missing:
             return '你想取消哪一个订阅？我可以先列出你所有的自动续费。'
+        if 'product' in missing:
+            return ('你想操作哪一个理财产品？你当前持有的产品可以用'
+                    '「我有哪些理财」查看。')
+        if 'amount' in missing and 'product' not in missing:
+            return '请问金额是多少？'
         return '我还缺一点信息才能继续。'
 
     def _build_params(self, intent, action):
@@ -485,9 +499,15 @@ class AgentSession:
         elif action == 'subscription.cancel':
             params['merchant'] = s['merchant']
 
-        elif action in ('wealth.purchase',):
+        elif action == 'wealth.purchase':
             params['amount'] = yuan_to_cents(s.get('amount_yuan') or 0)
             params['amount_yuan'] = s.get('amount_yuan')
+            params['product'] = s.get('product')
+
+        elif action == 'wealth.redeem':
+            params['amount'] = yuan_to_cents(s.get('amount_yuan') or 0)
+            params['amount_yuan'] = s.get('amount_yuan')
+            params['product'] = s.get('product')
 
         elif action == 'card.limit_change':
             # 按 action 判断（见方法开头的说明）。注意 0 是合法值，
@@ -536,15 +556,23 @@ class AgentSession:
             return {'cancelled': cur.rowcount, 'merchant': merchant}
 
         if action == 'wealth.list':
-            return {'products': WEALTH_PRODUCTS}
+            return {'products': WEALTH_CATALOG}
 
         if action == 'wealth.holdings':
-            return {'holdings': [
-                {'name': '稳健增利 90 天', 'amount': yuan_to_cents(20000),
-                 'annualized': 0.031, 'profit': yuan_to_cents(512.30)},
-                {'name': '货币基金 A', 'amount': yuan_to_cents(5000),
-                 'annualized': 0.018, 'profit': yuan_to_cents(92.50)},
-            ]}
+            rows = self.core.holdings(acct)
+            return {'holdings': rows}
+
+        if action == 'wealth.purchase':
+            if not idem_key:
+                raise BankError('MISSING_IDEM_KEY', '内部错误：缺少幂等键')
+            return self.core.purchase(acct, params['product'], params['amount'],
+                                      idem_key)
+
+        if action == 'wealth.redeem':
+            if not idem_key:
+                raise BankError('MISSING_IDEM_KEY', '内部错误：缺少幂等键')
+            return self.core.redeem(acct, params['product'], params['amount'],
+                                    idem_key)
 
         if action in ('transfer.small', 'transfer.large', 'transfer.scheduled'):
             if not idem_key:
@@ -707,8 +735,19 @@ class AgentSession:
                                % (cents_to_yuan(result['total']), result['people'],
                                   result['share_text'])}
         if action == 'wealth.purchase':
-            return {'type': 'result', 'data': result,
-                    'message': '申购请求已提交。'}
+            replay = result.get('idempotent_replay')
+            msg = ('已申购「%s」**%s 元**。订单号 `%s`，活期余额 %s 元。'
+                   % (op.params.get('product'), cents_to_yuan(result['amount']),
+                      result['order_id'], cents_to_yuan(result.get('balance_after', 0))))
+            if replay:
+                msg += '\n\n（注：这是同一笔请求的重复提交，已按幂等处理，**没有重复扣款**。）'
+            return {'type': 'result', 'data': result, 'message': msg}
+        if action == 'wealth.redeem':
+            msg = ('已赎回「%s」**%s 元**，结转收益 %s 元。订单号 `%s`，活期余额 %s 元。'
+                   % (op.params.get('product'), cents_to_yuan(result['amount']),
+                      cents_to_yuan(result.get('profit_settled', 0)),
+                      result['order_id'], cents_to_yuan(result.get('balance_after', 0))))
+            return {'type': 'result', 'data': result, 'message': msg}
         return {'type': 'result', 'data': result, 'message': '操作已完成。'}
 
     def _summarize(self, action, params):
@@ -723,8 +762,12 @@ class AgentSession:
             'card.freeze': lambda p: '挂失并冻结卡片',
             'card.unfreeze': lambda p: '解除卡片挂失状态',
             'card.limit_change': lambda p: '调整单日转出上限',
-            'wealth.purchase': lambda p: '申购理财产品 %s 元' % cents_to_yuan(p.get('amount', 0)),
-            'wealth.redeem': lambda p: '赎回理财产品',
+            'wealth.purchase': lambda p: '申购「%s」%s 元'
+                                          % (p.get('product') or '理财产品',
+                                             cents_to_yuan(p.get('amount', 0))),
+            'wealth.redeem': lambda p: '赎回「%s」%s 元'
+                                        % (p.get('product') or '理财产品',
+                                           cents_to_yuan(p.get('amount', 0))),
             'split.request': lambda p: '发起 AA 收款，%d 人平摊' % p.get('people', 0),
         }
         fn = labels.get(action)
@@ -755,7 +798,12 @@ class AgentSession:
                       else '—（未解析到金额，请勿确认）'))
         elif action == 'wealth.purchase':
             d.append(('账户', params.get('acct')))
+            d.append(('产品', params.get('product') or '—'))
             d.append(('金额', '%s 元' % cents_to_yuan(params.get('amount') or 0)))
+        elif action == 'wealth.redeem':
+            d.append(('账户', params.get('acct')))
+            d.append(('产品', params.get('product') or '—'))
+            d.append(('赎回金额', '%s 元' % cents_to_yuan(params.get('amount') or 0)))
         return [{'label': a, 'value': b} for a, b in d]
 
     def _safe_params(self, params):
@@ -787,16 +835,8 @@ class AgentSession:
 
 
 # 演示用理财产品（真实系统会从产品库读）
-WEALTH_PRODUCTS = [
-    {'name': '货币基金 A', 'term': '随时可取', 'annualized': 0.0185,
-     'min_amount': yuan_to_cents(1), 'risk': '低'},
-    {'name': '稳健增利 90 天', 'term': '90 天', 'annualized': 0.0310,
-     'min_amount': yuan_to_cents(1000), 'risk': '中低'},
-    {'name': '固收增强 180 天', 'term': '180 天', 'annualized': 0.0385,
-     'min_amount': yuan_to_cents(5000), 'risk': '中'},
-    {'name': '指数增强组合', 'term': '365 天', 'annualized': 0.0620,
-     'min_amount': yuan_to_cents(10000), 'risk': '中高'},
-]
+# 产品目录已移到 bank/core.py —— 申购/赎回的校验（起购金额、产品存在性）
+# 必须在执行入口那一侧，否则上层可以绕过校验直接调 purchase()。
 
 
 # ══════════════════════════════════════════════════════════════════════

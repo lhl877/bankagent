@@ -40,7 +40,8 @@ import operator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bank.core import BankError, yuan_to_cents, cents_to_yuan
+from bank.core import (BankError, yuan_to_cents, cents_to_yuan,
+                        WEALTH_CATALOG)
 from security.permissions import (
     check_tier, payload_hash, ConfirmationStore, CircuitBreaker,
     GREEN, YELLOW, RED, TIER_LABEL, ACTIONS,
@@ -270,6 +271,10 @@ def parse_amount_yuan(text):
     # 词边界，`\bA0*\d+\b` 永远匹配不上，scrub 会静默失效。
     # 实测教训：这个 bug 让「把A004的钱转给A001」里的 4 被当成 4 元金额。
     scrub = re.sub(r'A0*\d+', ' ', text, flags=re.I)                  # 账号 A004
+    # 量词表里**不能有「元/块/圆」**。踩过的坑：原先写成了
+    # `\d+\s*(月|日|号|次|个|人|天|年|周|元)`，结果「赎回 1000 元货币基金」
+    # 里的「1000 元」被整段擦掉，金额变成 None —— 用户说了金额却被告知没给。
+    # 「元」是钱单位，是要保留的信号，不是要过滤的噪声。
     scrub = re.sub(r'\d+\s*(月|日|号|次|个|人|天|年|周)', ' ', scrub)  # 日期/量词
 
     # ── 阿拉伯数字 + 单位 ───────────────────────────────────────────
@@ -356,8 +361,12 @@ class IntentParser:
             return Intent('unknown', confidence=0.0, raw=t)
 
         # 顺序重要：先匹配更具体的意图，避免被泛化规则误捕
+        # 顺序决定歧义归属，这里的次序是实测调出来的：
+        #   卡 必须在 理财 **之前** —— 否则「买卡」会被理财的「买」拦走。
+        #   理财 必须在 转账 **之前** —— 否则「赎回 1000 元」会被转账的金额规则吃掉。
+        # 每条注释都对应一次真实的误判，改动前请先跑意图回归。
         for handler in (self._p_balance, self._p_bill, self._p_subscription,
-                        self._p_wealth, self._p_card, self._p_transfer,
+                        self._p_card, self._p_wealth, self._p_transfer,
                         self._p_greeting):
             it = handler(t, session_state)
             if it:
@@ -400,17 +409,58 @@ class IntentParser:
         return None
 
     def _p_wealth(self, t, _):
-        if re.search(r'理财|基金|收益|投资|申购|赎回|年化', t):
+        # 触发词必须包含「买/购买」——否则「买 5000 元稳健增利」
+        # 这类不带「理财/基金」字样的说法完全进不来。
+        # 「买卡」不会走到这里：卡场景在解析顺序上更靠前，已先一步截获。
+        if re.search(r'理财|基金|收益|投资|申购|赎回|年化|买|购买', t):
             acct = self._extract_account(t) or 'A001'
+            product = self._extract_product(t, acct)
             if re.search(r'赎回|取出|卖掉', t):
-                return Intent('wealth_redeem', {'acct': acct}, 0.85)
-            if re.search(r'买|申购|投|入手', t):
+                # 金额必须一起带上 —— 漏了它会导致「赎回 1000 元X」被当成缺金额，
+                # 走追问分支问用户"请问转多少钱？"（而且措辞还是转账的）。
+                amt = parse_amount_yuan(t)
+                return Intent('wealth_redeem',
+                              {'acct': acct, 'product': product,
+                               'amount_yuan': amt}, 0.85)
+            # 「买」是口语最常见的申购说法，必须支持。
+            # 但不能裸匹配 —— 要排除「买卡」（那是卡场景），
+            # 否则「买一张虚拟卡」会被当成理财申购。
+            if re.search(r'申购|入手|购买|(?<!买)买(?!卡)', t):
                 amt = parse_amount_yuan(t)
                 return Intent('wealth_purchase',
-                              {'acct': acct, 'amount_yuan': amt}, 0.85)
+                              {'acct': acct, 'amount_yuan': amt,
+                               'product': product}, 0.85)
             if re.search(r'我的|持仓|赚了|亏了|收益', t):
                 return Intent('wealth_holdings', {'acct': acct}, 0.9)
             return Intent('wealth_list', {'acct': acct}, 0.9)
+        return None
+
+    def _extract_product(self, t, acct):
+        """识别用户说的是哪个理财产品。
+
+        三种情况：
+          1. 原样说出产品名（「稳健增利 90 天」）→ 直接命中；
+          2. 模糊说法（「那个货币基金」「90 天那个」）→ 用关键词包含匹配；
+          3. **没说产品名但持仓只有一个**（「赎回我的理财」）→ 补全为那一个。
+        第 3 种是有意的：只有一个持仓时追问"你要赎回哪个"既啰嗦又没意义。
+        但持仓有多个时**不猜** —— 返回 None 让上层追问，因为赎回错产品是资金误解。
+        """
+        # 1) 产品名原样出现
+        for spec in WEALTH_CATALOG:
+            if spec['name'] in t:
+                return spec['name']
+        # 2) 关键词包含匹配：取产品名里的特征词
+        keys = {'货币基金 A': ['货币', '货币基金'],
+                '稳健增利 90 天': ['稳健', '增利', '90天', '90 天'],
+                '固收增强 180 天': ['固收', '增强', '180天', '180 天'],
+                '指数增强组合': ['指数', '组合']}
+        for name, kws in keys.items():
+            if any(k in t for k in kws):
+                return name
+        # 3) 未指名：只在持仓唯一时补全
+        held = [h['product'] for h in self.core.holdings(acct)]
+        if len(held) == 1:
+            return held[0]
         return None
 
     def _p_card(self, t, _):
@@ -425,7 +475,11 @@ class IntentParser:
             amt = parse_amount_yuan(t)
             return Intent('card_limit_change',
                           {'acct': acct, 'limit_yuan': amt}, 0.82)
-        if re.search(r'虚拟卡|新卡|开卡|办卡|申请卡', t):
+        # 注意这里**不能出现裸「买」**。原先写的是 `虚拟卡|新卡|开卡|办卡|买卡|申请卡`，
+        # 其中「买卡」里的「买」会抢先匹配「买 5000 元理财」—— 因为卡场景在
+        # 意图解析顺序里排在理财之前。修法是要求「买」必须与卡同时出现。
+        # 允许空格：「买 卡」「买一张 卡」都算。
+        if re.search(r'虚拟卡|新卡|开卡|办卡|申请卡|办一张卡|买\s*一?\s*张?\s*卡', t):
             acct = self._extract_account(t) or 'A001'
             return Intent('card_apply_virtual', {'acct': acct}, 0.9)
         return None
