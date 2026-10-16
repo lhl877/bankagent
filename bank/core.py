@@ -53,6 +53,26 @@ def cents_to_yuan(cents):
     return '%.2f' % (cents / 100.0)
 
 
+def _today_str(today=None):
+    """返回 'YYYY-MM-DD'。
+
+    为什么要把它抽成函数而不是到处调 time.strftime：
+    跨场景联动依赖"今天"来判断步骤是否到期。若直接读系统时间，
+    测试就会依赖运行当天的日期 —— 今天跑绿、明天跑红那种不稳定。
+    所以日期一律从参数注入，默认才取真实时间。
+    """
+    if today:
+        return today if isinstance(today, str) else str(today)
+    return time.strftime('%Y-%m-%d')
+
+
+def add_days(date_str, days):
+    """日期加减天数，返回 'YYYY-MM-DD'。用标准库，不引入依赖。"""
+    import datetime as _dt
+    d = _dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+    return (d + _dt.timedelta(days=days)).isoformat()
+
+
 # 演示用理财产品目录。
 # 放在 core 层而不是 orchestrator 层，因为申购/赎回要在这里校验起购金额与产品存在性 ——
 # 校验依据必须位于执行入口这一侧，否则上层可以绕过校验直接调 purchase()。
@@ -127,6 +147,13 @@ class Core:
           owner_name  TEXT NOT NULL,
           phone       TEXT,
           balance     INTEGER NOT NULL DEFAULT 0,   -- 单位：分
+          -- 锁定金额（分）：为跨场景联动预留的资金。
+          -- 设计要点：**余额不动，只是标出这部分不能花**。
+          -- 这样账实仍然相符（ledger 对得上 balance），
+          -- 而"能不能花"由 available() = balance - locked_amount 决定。
+          -- 若改成把锁定金额从 balance 里扣掉，就必须伪造一笔 ledger 支出，
+          -- 对账立刻不平 —— 那是自欺。
+          locked_amount INTEGER NOT NULL DEFAULT 0,
           currency    TEXT NOT NULL DEFAULT 'CNY',
           card_no     TEXT,
           card_status TEXT NOT NULL DEFAULT 'active',  -- active|frozen|lost
@@ -214,10 +241,58 @@ class Core:
           created_at INTEGER NOT NULL,
           UNIQUE (idem_key)
         );
+
+        -- ── 跨场景联动计划（赛题场景 6）──────────────────────────────
+        -- 一个计划 = 从一条信息推导出的一串跨领域动作。
+        -- 例：「我爱人生子」→ 锁定 1000 元 → 生日前 2 天订鲜花蛋糕 → 提醒。
+        CREATE TABLE IF NOT EXISTS linkage_plan (
+          id          TEXT PRIMARY KEY,
+          acct        TEXT NOT NULL REFERENCES account(id),
+          occasion    TEXT NOT NULL,           -- 事件名，如「爱人生日」
+          person      TEXT,                    -- 关联的人
+          event_date  TEXT NOT NULL,           -- 目标日期 YYYY-MM-DD
+          budget      INTEGER NOT NULL,        -- 预算（分）
+          locked      INTEGER NOT NULL DEFAULT 0,  -- 本计划已锁定金额（分）
+          status      TEXT NOT NULL,           -- planned|locked|done|cancelled
+          created_at  INTEGER NOT NULL,
+          locked_at   INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_linkage_acct ON linkage_plan(acct, status);
+
+        CREATE TABLE IF NOT EXISTS linkage_step (
+          id          TEXT PRIMARY KEY,
+          plan_id     TEXT NOT NULL REFERENCES linkage_plan(id),
+          seq         INTEGER NOT NULL,        -- 执行顺序
+          kind        TEXT NOT NULL,           -- order_gift|remind|...
+          detail      TEXT NOT NULL,           -- 人类可读的动作描述
+          amount      INTEGER NOT NULL DEFAULT 0,  -- 该步骤要花的钱（分）
+          due_date    TEXT NOT NULL,           -- 应执行日期 YYYY-MM-DD
+          status      TEXT NOT NULL,           -- pending|done|skipped
+          idem_key    TEXT,
+          executed_at INTEGER,
+          result      TEXT,
+          UNIQUE (idem_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_step_plan ON linkage_step(plan_id, seq);
         ''')
+        self._migrate_columns()
         row = c.execute("SELECT val FROM meta WHERE key='schema_version'").fetchone()
         if not row:
             c.execute("INSERT INTO meta(key,val) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+
+    def _migrate_columns(self):
+        """给**已存在的**表补新增的列。
+
+        为什么需要单独一步：
+        `CREATE TABLE IF NOT EXISTS` 只在表不存在时建表。表已经存在时，
+        新加的列**不会**被补上 —— 于是老库跑新代码会报
+        "no such column: locked_amount"，而且报错点在很深的查询里，不好定位。
+        改表结构时必须同时给出这条补列路径，否则升级就是坏的。
+        """
+        c = self._conn()
+        cols = {r['name'] for r in c.execute('PRAGMA table_info(account)')}
+        if 'locked_amount' not in cols:
+            c.execute('ALTER TABLE account ADD COLUMN locked_amount INTEGER NOT NULL DEFAULT 0')
 
     # ── 读 ─────────────────────────────────────────────────────────────
     def get_account(self, acct_id):
@@ -320,10 +395,19 @@ class Core:
             if src['card_status'] != 'active':
                 raise BankError('ACCOUNT_LOCKED',
                                 '付款账户状态为「%s」，无法转出' % src['card_status'])
-            if src['balance'] < amount:
+            # 用**可动用余额**而不是余额。
+            # 跨场景联动预留的钱（locked_amount）是"不能花"的，
+            # 若这里只看 balance，用户把预留资金花掉后，
+            # 到期该订的鲜花就付不出钱了 —— 预留形同虚设。
+            free = src['balance'] - src['locked_amount']
+            if free < amount:
+                detail = ''
+                if src['locked_amount'] > 0:
+                    detail = '（余额 %s 元中另有 %s 元已为联动计划锁定）' % (
+                        cents_to_yuan(src['balance']), cents_to_yuan(src['locked_amount']))
                 raise BankError('INSUFFICIENT_FUNDS',
-                                '余额不足：可用 %s 元，需要 %s 元'
-                                % (cents_to_yuan(src['balance']), cents_to_yuan(amount)))
+                                '可动用余额不足：可用 %s 元，需要 %s 元%s'
+                                % (cents_to_yuan(free), cents_to_yuan(amount), detail))
 
             # 3) 单日限额（这里只做账户级硬约束；"日累计 > 1000 元需强验证"由权限引擎负责）
             already = self.daily_outgoing(from_acct)
@@ -507,10 +591,15 @@ class Core:
             a = c.execute('SELECT * FROM account WHERE id=?', (acct_id,)).fetchone()
             if not a:
                 raise BankError('ACCOUNT_NOT_FOUND', '账户不存在')
-            if a['balance'] < amount:
+            # 同样用可动用余额：被联动计划锁定的钱不能拿去申购理财
+            free = a['balance'] - a['locked_amount']
+            if free < amount:
+                detail = ''
+                if a['locked_amount'] > 0:
+                    detail = '（其中 %s 元已为联动计划锁定）' % cents_to_yuan(a['locked_amount'])
                 raise BankError('INSUFFICIENT_FUNDS',
-                                '活期余额不足：可用 %s 元，需要 %s 元'
-                                % (cents_to_yuan(a['balance']), cents_to_yuan(amount)))
+                                '活期可用余额不足：可用 %s 元，需要 %s 元%s'
+                                % (cents_to_yuan(free), cents_to_yuan(amount), detail))
 
             now = int(time.time() * 1000)
             oid = 'WO' + uuid.uuid4().hex[:12].upper()
@@ -615,6 +704,302 @@ class Core:
             c.execute('ROLLBACK')
             raise
 
+    # ══════════════════════════════════════════════════════════════════
+    # 跨场景联动（赛题场景 6）
+    # ══════════════════════════════════════════════════════════════════
+    def available(self, acct_id):
+        """可动用余额 = 余额 − 锁定金额。
+
+        这是"锁定"这个概念的**唯一判定口径**。所有花钱的入口都必须用它，
+        而不是 balance —— 否则锁定形同虚设（钱被"锁"了却还能花）。
+        """
+        a = self.get_account(acct_id)
+        return a['balance'] - a['locked_amount']
+
+    def create_plan(self, acct_id, occasion, event_date, budget, steps,
+                    person=None, idem_key=None):
+        """登记一个联动计划。**不动钱**，只记录意图与步骤。
+
+        参数：
+          event_date —— 'YYYY-MM-DD'，目标日期（如爱人生日）
+          budget     —— 预算（分）
+          steps      —— [{'kind','detail','amount','due_date','seq'}, ...]
+
+        安全属性：登记本身没有副作用，所以不需要幂等键也不会造成损失。
+        但**若传入 idem_key 则按其幂等**，便于上层重试。
+        """
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+            raise BankError('INVALID_BUDGET', '预算必须是正整数（单位分）')
+        self.get_account(acct_id)          # 账户不存在直接抛
+
+        c = self.conn
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            if idem_key:
+                prev = c.execute(
+                    'SELECT * FROM linkage_plan WHERE id=?', ('LP' + idem_key,)).fetchone()
+                if prev:
+                    c.execute('COMMIT')
+                    return {'plan_id': prev['id'], 'status': prev['status'],
+                            'idempotent_replay': True}
+
+            now = int(time.time() * 1000)
+            pid = 'LP' + (idem_key or uuid.uuid4().hex[:16]).upper()
+            c.execute('INSERT INTO linkage_plan(id,acct,occasion,person,event_date,'
+                      'budget,locked,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                      (pid, acct_id, occasion, person, event_date, budget, 0,
+                       'planned', now))
+            for i, st in enumerate(steps):
+                c.execute('INSERT INTO linkage_step(id,plan_id,seq,kind,detail,'
+                          'amount,due_date,status) VALUES(?,?,?,?,?,?,?,?)',
+                          ('LS%s%02d' % (pid[-8:], i), pid, st.get('seq', i),
+                           st['kind'], st['detail'], st.get('amount', 0),
+                           st['due_date'], 'pending'))
+            c.execute('COMMIT')
+            return {'plan_id': pid, 'status': 'planned',
+                    'idempotent_replay': False, 'steps': len(steps)}
+        except BankError:
+            c.execute('ROLLBACK')
+            raise
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
+
+    def list_plans(self, acct_id=None, status=None):
+        sql = 'SELECT * FROM linkage_plan'
+        args = []
+        where = []
+        if acct_id:
+            where.append('acct=?')
+            args.append(acct_id)
+        if status:
+            where.append('status=?')
+            args.append(status)
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        sql += ' ORDER BY event_date, id'
+        plans = [dict(r) for r in self.conn.execute(sql, args)]
+        for p in plans:
+            p['steps'] = [dict(r) for r in self.conn.execute(
+                'SELECT * FROM linkage_step WHERE plan_id=? ORDER BY seq', (p['id'],))]
+        return plans
+
+    def get_plan(self, plan_id):
+        r = self.conn.execute('SELECT * FROM linkage_plan WHERE id=?',
+                              (plan_id,)).fetchone()
+        if not r:
+            raise BankError('PLAN_NOT_FOUND', '找不到这个联动计划：%s' % plan_id)
+        p = dict(r)
+        p['steps'] = [dict(x) for x in self.conn.execute(
+            'SELECT * FROM linkage_step WHERE plan_id=? ORDER BY seq', (plan_id,))]
+        return p
+
+    def lock_funds(self, plan_id, idem_key=None):
+        """为一个计划锁定资金。**余额不变，只标记不可动用。**
+
+        为什么余额不变：
+        锁定不是扣款 —— 钱还在账户里，只是被预留了。若这里直接扣 balance，
+        就必须同时伪造一笔 ledger 支出，`reconcile()` 立刻不平。
+        所以只改 locked_amount，账实仍然相符。
+        """
+        c = self.conn
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            p = c.execute('SELECT * FROM linkage_plan WHERE id=?', (plan_id,)).fetchone()
+            if not p:
+                raise BankError('PLAN_NOT_FOUND', '找不到这个联动计划')
+            if p['status'] == 'cancelled':
+                raise BankError('PLAN_CANCELLED', '该计划已取消，无法锁定资金')
+            if p['locked'] > 0:
+                c.execute('COMMIT')
+                return {'plan_id': plan_id, 'status': p['status'],
+                        'locked': p['locked'], 'idempotent_replay': True}
+
+            a = c.execute('SELECT * FROM account WHERE id=?', (p['acct'],)).fetchone()
+            free = a['balance'] - a['locked_amount']
+            if free < p['budget']:
+                raise BankError('INSUFFICIENT_AVAILABLE',
+                                '可动用余额不足：可动用 %s 元（余额 %s − 已锁定 %s），'
+                                '本计划需要 %s 元'
+                                % (cents_to_yuan(free), cents_to_yuan(a['balance']),
+                                   cents_to_yuan(a['locked_amount']),
+                                   cents_to_yuan(p['budget'])))
+
+            now = int(time.time() * 1000)
+            c.execute('UPDATE account SET locked_amount=locked_amount+? WHERE id=?',
+                      (p['budget'], p['acct']))
+            c.execute('UPDATE linkage_plan SET locked=?,status=?,locked_at=? WHERE id=?',
+                      (p['budget'], 'locked', now, plan_id))
+            c.execute('COMMIT')
+            return {'plan_id': plan_id, 'status': 'locked', 'locked': p['budget'],
+                    'idempotent_replay': False,
+                    'balance': a['balance'],
+                    'available_after': free - p['budget']}
+        except BankError:
+            c.execute('ROLLBACK')
+            raise
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
+
+    def release_lock(self, plan_id):
+        """释放计划的锁定资金（余额不变，可动用额度恢复）。"""
+        c = self.conn
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            p = c.execute('SELECT * FROM linkage_plan WHERE id=?', (plan_id,)).fetchone()
+            if not p:
+                raise BankError('PLAN_NOT_FOUND', '找不到这个联动计划')
+            if p['locked'] <= 0:
+                c.execute('COMMIT')
+                return {'plan_id': plan_id, 'released': 0, 'idempotent_replay': True}
+            c.execute('UPDATE account SET locked_amount=locked_amount-? WHERE id=?',
+                      (p['locked'], p['acct']))
+            c.execute('UPDATE linkage_plan SET locked=0 WHERE id=?', (plan_id,))
+            c.execute('COMMIT')
+            return {'plan_id': plan_id, 'released': p['locked'],
+                    'idempotent_replay': False}
+        except BankError:
+            c.execute('ROLLBACK')
+            raise
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
+
+    def execute_step(self, plan_id, step_id, idem_key, today=None):
+        """执行一个联动步骤（实际花钱）。**这是本模块唯一的资金出口。**
+
+        这是"跨场景"里真正扣钱的那一步，所以约束最严：
+          · 计划必须已锁定资金（防止未预留就扣款）
+          · 步骤必须**已到期**（today >= due_date），未到期直接拒绝
+          · 幂等：同 idem_key 只成功一次
+          · 锁定金额按实际花费等比释放，余额同步扣减，并写 ledger
+
+        注意「外部订购」是**模拟**的：没有真实鲜花/蛋糕接口。
+        返回值里带 simulated=True，不要在文档或界面里宣称真的下单成功。
+        """
+        c = self.conn
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            prev = c.execute('SELECT * FROM linkage_step WHERE idem_key=?',
+                             (idem_key,)).fetchone()
+            if prev:
+                c.execute('COMMIT')
+                return {'step_id': prev['id'], 'status': prev['status'],
+                        'idempotent_replay': True, 'simulated': True}
+
+            p = c.execute('SELECT * FROM linkage_plan WHERE id=?', (plan_id,)).fetchone()
+            if not p:
+                raise BankError('PLAN_NOT_FOUND', '找不到这个联动计划')
+            if p['status'] == 'cancelled':
+                raise BankError('PLAN_CANCELLED', '该计划已取消，不能执行')
+            if p['locked'] <= 0:
+                raise BankError('NOT_LOCKED',
+                                '该计划尚未锁定资金，不能执行扣款步骤。'
+                                '请先确认锁定，避免动用未预留的余额。')
+
+            st = c.execute('SELECT * FROM linkage_step WHERE id=? AND plan_id=?',
+                           (step_id, plan_id)).fetchone()
+            if not st:
+                raise BankError('STEP_NOT_FOUND', '找不到这个步骤：%s' % step_id)
+            if st['status'] == 'done':
+                c.execute('COMMIT')
+                return {'step_id': step_id, 'status': 'done',
+                        'idempotent_replay': True, 'simulated': True}
+
+            # 到期校验：不依赖真实系统时间，"今天"可注入
+            today = today or _today_str()
+            if today < st['due_date']:
+                raise BankError('NOT_DUE',
+                                '该步骤还未到期：应于 %s 执行，今天是 %s。'
+                                '提前执行会打乱时序，已拒绝。'
+                                % (st['due_date'], today))
+
+            amt = st['amount']
+            a = c.execute('SELECT * FROM account WHERE id=?', (p['acct'],)).fetchone()
+            if amt > 0 and a['balance'] < amt:
+                raise BankError('INSUFFICIENT_FUNDS',
+                                '余额不足以执行该步骤：可用 %s 元，需要 %s 元'
+                                % (cents_to_yuan(a['balance']), cents_to_yuan(amt)))
+
+            now = int(time.time() * 1000)
+            new_balance = a['balance']
+            # 锁定金额按实际花费释放，且不超过本计划剩余锁定额
+            release = min(amt, p['locked'])
+            new_locked = a['locked_amount'] - release
+            if amt > 0:
+                new_balance = a['balance'] - amt
+                c.execute('UPDATE account SET balance=?, locked_amount=? WHERE id=?',
+                          (new_balance, new_locked, p['acct']))
+                # 资金变动必须留痕 —— 不留痕 reconcile() 立刻不平
+                c.execute('INSERT INTO ledger(transfer_id,acct,owner_acct,direction,'
+                          'amount,balance_after,created_at) VALUES(?,?,?,?,?,?,?)',
+                          (None, p['acct'], p['acct'], 'debit', amt, new_balance, now))
+            else:
+                c.execute('UPDATE account SET locked_amount=? WHERE id=?',
+                          (new_locked, p['acct']))
+
+            result = json.dumps({
+                'simulated': True,
+                'note': '外部订购为模拟：本项目没有真实的鲜花/蛋糕供应商接口',
+                'kind': st['kind'], 'detail': st['detail'],
+            }, ensure_ascii=False)
+            c.execute('UPDATE linkage_step SET status=?,idem_key=?,executed_at=?,'
+                      'result=? WHERE id=?',
+                      ('done', idem_key, now, result, step_id))
+            c.execute('UPDATE linkage_plan SET locked=locked-? WHERE id=?',
+                      (release, plan_id))
+
+            # 所有步骤都完成 → 计划置为 done，并释放剩余锁定
+            left = c.execute('SELECT COUNT(*) AS n FROM linkage_step '
+                             'WHERE plan_id=? AND status!="done"', (plan_id,)).fetchone()['n']
+            freed = 0
+            if left == 0:
+                rem = c.execute('SELECT locked FROM linkage_plan WHERE id=?',
+                                (plan_id,)).fetchone()['locked']
+                if rem > 0:
+                    c.execute('UPDATE account SET locked_amount=locked_amount-? WHERE id=?',
+                              (rem, p['acct']))
+                    c.execute('UPDATE linkage_plan SET locked=0,status=? WHERE id=?',
+                              ('done', plan_id))
+                    freed = rem
+                else:
+                    c.execute('UPDATE linkage_plan SET status=? WHERE id=?',
+                              ('done', plan_id))
+
+            c.execute('COMMIT')
+            return {'step_id': step_id, 'status': 'done', 'simulated': True,
+                    'idempotent_replay': False, 'amount': amt,
+                    'kind': st['kind'], 'detail': st['detail'],
+                    'balance_after': new_balance, 'released': release,
+                    'released_on_completion': freed,
+                    'steps_left': left}
+        except BankError:
+            c.execute('ROLLBACK')
+            raise
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
+
+    def due_steps(self, acct_id=None, today=None):
+        """查询**今天应执行（含逾期）**且计划已锁定资金的步骤。
+
+        这是"到期执行"的模拟入口：真实系统里由定时任务轮询调用，
+        这里暴露成可查询方法，便于演示与测试。
+        """
+        today = today or _today_str()
+        sql = '''SELECT s.*, p.acct, p.occasion, p.person, p.status AS plan_status,
+                        p.locked AS plan_locked
+                 FROM linkage_step s JOIN linkage_plan p ON p.id = s.plan_id
+                 WHERE s.status='pending' AND s.due_date <= ?
+                   AND p.status='locked' '''
+        args = [today]
+        if acct_id:
+            sql += ' AND p.acct=?'
+            args.append(acct_id)
+        sql += ' ORDER BY s.due_date, s.seq'
+        return [dict(r) for r in self.conn.execute(sql, args)]
+
     def close(self):
         """关闭所有线程的连接。"""
         for c in self._conns:
@@ -667,7 +1052,8 @@ def reset_data(core):
     c.execute('BEGIN IMMEDIATE')
     try:
         for t in ('ledger', 'transfer', 'subscription', 'card_application',
-                  'holding', 'wealth_order', 'account'):
+                  'holding', 'wealth_order', 'linkage_step', 'linkage_plan',
+                  'account'):
             c.execute('DELETE FROM %s' % t)
         c.execute("DELETE FROM meta WHERE key LIKE 'opening:%'")
         c.execute('COMMIT')
@@ -685,9 +1071,11 @@ def _seed(core):
     for aid, name, phone, init_yuan, tail, status in SEED:
         cents = yuan_to_cents(init_yuan)
         c.execute(
-            'INSERT OR REPLACE INTO account(id,owner_name,phone,balance,currency,'
-            'card_no,card_status,daily_limit,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-            (aid, name, phone, cents, 'CNY', '**** **** **** ' + tail, status, 5000000, now))
+            'INSERT OR REPLACE INTO account(id,owner_name,phone,balance,locked_amount,'
+            'currency,card_no,card_status,daily_limit,created_at) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?)',
+            (aid, name, phone, cents, 0, 'CNY',
+             '**** **** **** ' + tail, status, 5000000, now))
         c.execute('INSERT OR REPLACE INTO meta(key,val) VALUES(?,?)',
                   ('opening:%s' % aid, str(cents)))
 

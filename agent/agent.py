@@ -435,6 +435,87 @@ class IntentParser:
             return Intent('wealth_list', {'acct': acct}, 0.9)
         return None
 
+    def _p_linkage(self, t, _):
+        """跨场景联动（赛题场景 6）。
+
+        典型说法：「我爱人生日，帮我当月锁定 1000 元，生日前 2 天订鲜花蛋糕」
+
+        要点是**跨领域**：时间（生日前 2 天）+ 资金预留（锁定 1000）+ 外部订购
+        （鲜花、蛋糕）+ 提醒。所以这里要抽的不只是金额，还有「事件」与「人」。
+
+        时间词处理：**不在这里解析相对日期**（"生日前 2 天"要基于生日才能算）。
+        解析器只负责认出这是一条联动需求并抽出事件/人/预算，
+        具体日期由编排层按事件日期推算 —— 这样职责清楚，
+        也避免解析器里出现第二套日期逻辑。
+        """
+        KEY = r'生日|纪念日|节日|送礼|礼物|鲜花|蛋糕|联动|提前准备|备忘'
+        if not re.search(KEY, t) and not re.search(r'锁定.*(?:元|块).*?(?:准备|到时候|生日)', t):
+            return None
+
+        acct = self._extract_account(t) or 'A001'
+
+        # ── 查计划 ────────────────────────────────────────────────────
+        if re.search(r'有(?:哪些|什么|没有).*(?:计划|安排)|(?<!锁)计划(?:列表|清单)?$|'
+                     r'我的.*(?:联动|计划|安排)', t):
+            return Intent('linkage_list', {'acct': acct}, 0.9)
+
+        # ── 锁定资金 ──────────────────────────────────────────────────
+        if re.search(r'锁定|预留|冻结(?:一笔|资金)|圈起来|别动', t) \
+                and not re.search(r'订|买|下单', t):
+            amt = parse_amount_yuan(t)
+            return Intent('linkage_lock',
+                          {'acct': acct, 'amount_yuan': amt,
+                           'occasion_text': self._extract_occasion(t)}, 0.88)
+
+        # ── 执行到期步骤 ──────────────────────────────────────────────
+        if re.search(r'执行|下单|订(?:购)?|买(?:好|了)|现在(?:就)?办|到期', t) \
+                and re.search(r'鲜花|蛋糕|礼物|步骤|计划', t):
+            return Intent('linkage_run',
+                          {'acct': acct, 'occasion_text': self._extract_occasion(t)}, 0.85)
+
+        # ── 登记计划（默认分支）──────────────────────────────────────
+        amt = parse_amount_yuan(t)
+        return Intent('linkage_create',
+                      {'acct': acct,
+                       'amount_yuan': amt,
+                       'occasion_text': self._extract_occasion(t),
+                       'person': self._extract_person(t),
+                       'event_date': self._extract_date(t)}, 0.87)
+
+    def _extract_occasion(self, t):
+        """抽出事件类型。目前支持的几类都映射到一个标准事件名。"""
+        table = [
+            ('爱人生日', r'爱人.*生日|老婆.*生日|先生.*生日|伴侣.*生日'),
+            ('父母生日', r'(?:爸|妈|父亲|母亲|父母).*生日'),
+            ('子女生日', r'(?:孩子|儿子|女儿|宝宝).*生日'),
+            ('生日', r'生日'),
+            ('纪念日', r'纪念日|结婚纪念'),
+            ('节日', r'节日|过节|春节|中秋|端午'),
+        ]
+        for name, pat in table:
+            if re.search(pat, t):
+                return name
+        return None
+
+    def _extract_person(self, t):
+        m = re.search(r'(爱人|老婆|老公|先生|太太|伴侣|爸爸|妈妈|父亲|母亲|'
+                      r'儿子|女儿|孩子|宝宝)', t)
+        return m.group(1) if m else None
+
+    def _extract_date(self, t):
+        """抽出显式日期（YYYY-MM-DD / M月D日）。
+
+        只说"生日"而不给日期的，**这里返回 None**，由编排层用配置里的
+        默认事件日期兜底或向用户追问 —— 猜一个生日比问一句危险得多。
+        """
+        m = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', t)
+        if m:
+            return '%04d-%02d-%02d' % (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        m = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]', t)
+        if m:
+            return '2026-%02d-%02d' % (int(m.group(1)), int(m.group(2)))
+        return None
+
     def _extract_product(self, t, acct):
         """识别用户说的是哪个理财产品。
 
