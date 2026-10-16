@@ -26,7 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bank.core import Core, init_db, reset_data, cents_to_yuan, BankError
 from security.permissions import ConfirmationStore, CircuitBreaker, TIER_LABEL, ACTIONS
 from security.audit import AuditLog
-from agent.orchestrator import AgentSession, WEALTH_PRODUCTS
+from agent.orchestrator import AgentSession
+# 产品目录在 bank/core.py（申购校验要用它，必须位于执行入口那一侧）
+from bank.core import WEALTH_CATALOG
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(ROOT, 'web')
@@ -241,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json({
             'accounts': accts,
             'subscriptions': fmt_json(subs),
-            'products': fmt_json(WEALTH_PRODUCTS),
+            'products': fmt_json(WEALTH_CATALOG),
             'holdings': fmt_json([
                 {'name': '稳健增利 90 天', 'amount': 2000000, 'annualized': 0.031, 'profit': 51230},
                 {'name': '货币基金 A', 'amount': 500000, 'annualized': 0.018, 'profit': 9250},
